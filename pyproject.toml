@@ -1,0 +1,55 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "ms-core"
+version = "0.1.0"
+description = "Shared core library for mass spectrometry data processing, calibration, and statistical analysis."
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.10"
+authors = [{ name = "MS Toolbox Team" }]
+
+dependencies = [
+    "numpy>=1.24",
+    "pandas>=2.0",
+    "scipy>=1.10",
+    "scikit-learn>=1.2",
+    "statsmodels>=0.14",
+    "matplotlib>=3.7",
+    "seaborn>=0.12",
+    "openpyxl>=3.1",
+    "qnorm>=0.8",
+]
+
+[project.optional-dependencies]
+full = [
+    "plotly>=5.15",
+    "adjustText>=0.8",
+    "fancyimpute>=0.7",
+    "pyppca>=0.0.4",
+    "pyopls>=0.4",
+    "pycombat>=0.3",
+    "scikit-bio>=0.5",
+    "python-docx>=0.8",
+]
+dev = [
+    "pytest>=7.0",
+    "pytest-cov>=4.0",
+    "black>=23.0",
+    "ruff>=0.1",
+    "mypy>=1.0",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/ms_core"]
+
+[tool.black]
+line-length = 100
+
+[tool.ruff]
+line-length = 100
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
