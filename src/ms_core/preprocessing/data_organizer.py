@@ -69,6 +69,10 @@ class DataOrganizer(BaseProcessor):
         "blank": [r"blank", r"blk"],
         "standard": [r"std", r"standard", r"sdolek"],
     }
+    SAMPLE_TOKEN_REGEX = re.compile(
+        r"(?:EC\d{2,4}(?:_\d+)?|U\d{5}ZBEE|ZBEE\d{6}|pooled[_\s-]*QC[_\s-]*\d+|QC[_\s-]*sample[_\s-]*\d+|QC[_\s-]*\d+|blank)",
+        re.IGNORECASE,
+    )
 
     def __init__(self, config: Optional[DataOrganizerConfig] = None):
         """
@@ -79,6 +83,106 @@ class DataOrganizer(BaseProcessor):
         """
         super().__init__("Data Organizer")
         self.config = config or DataOrganizerConfig()
+
+    def _is_non_sample_column(self, column_name: str) -> bool:
+        """Return True when a column is metadata and should not be treated as a sample."""
+        name = str(column_name).strip().lower()
+        compact = re.sub(r"[^a-z0-9]+", "", name)
+        if compact in {"rowid", "featureid", "feature", "id", "mzmineid", "mzminertmin", "z"}:
+            return True
+        if name.startswith("unnamed:"):
+            return True
+        if "mzmine rt" in name:
+            return True
+        return False
+
+    def _extract_primary_sample_token(self, text: str) -> Optional[str]:
+        """Extract a canonical sample token from free text."""
+        if text is None:
+            return None
+        cleaned = str(text).strip()
+        if not cleaned:
+            return None
+        match = self.SAMPLE_TOKEN_REGEX.search(cleaned)
+        if not match:
+            # BC-style tissue sample naming from breast-cancer method files.
+            # Keep original wording so downstream BC/QC matching can use full context.
+            compact = re.sub(r"\s+", "", cleaned.lower())
+            if re.search(r"bc\d+_dna(?:\+rna|andrna)", compact):
+                return cleaned
+            if re.search(
+                r"\bbc\d+_(?:dna\s*(?:\+\s*|and\s*)rna|dnaandrna|dna\+rna|dna|rna)\b",
+                cleaned,
+                re.IGNORECASE,
+            ):
+                return cleaned
+            # Column-style names such as DNA_program1_TumorBC2257_DNA.
+            if re.search(r"\b(?:dna_)?program\d+_[a-z0-9_]*bc\d+_(?:dnaandrna|dna|rna)\b", cleaned, re.IGNORECASE):
+                return cleaned
+            return None
+        token = re.sub(r"\s+", "", match.group(0))
+        token = token.replace("-", "_")
+        return token
+
+    def _normalize_sample_key(self, sample_name: str) -> str:
+        """Normalize sample names from files/headers for robust matching."""
+        if sample_name is None:
+            return ""
+        token = str(sample_name).strip()
+        if not token:
+            return ""
+        token = self._extract_sample_name(token)
+        lower = token.lower()
+        lower = re.sub(r"[^a-z0-9]+", "_", lower).strip("_")
+        lower = re.sub(r"_+", "_", lower)
+
+        # Normalize QC naming variants.
+        lower = re.sub(r"qc[_\s-]*sample[_\s-]*(\d+)", r"qc_sample_\1", lower)
+        lower = re.sub(r"^qc[_\s-]*(\d+)$", r"qc_sample_\1", lower)
+        lower = re.sub(r"pooled[_\s-]*qc[_\s-]*(\d+)", r"pooled_qc_\1", lower)
+
+        # Normalize technical prefixes in column exports.
+        lower = re.sub(r"^(?:dna|rna)_program\d+_", "", lower)
+        lower = re.sub(r"^program\d+_", "", lower)
+        lower = re.sub(r"dna_(?:and_)?rna", "dnaandrna", lower)
+        lower = re.sub(r"dna_rna", "dnaandrna", lower)
+
+        # Normalize ZBEE000070 -> U00070ZBEE.
+        zbee_match = re.fullmatch(r"zbee(\d{6})", lower)
+        if zbee_match:
+            lower = f"u{int(zbee_match.group(1)):05d}zbee"
+
+        # Normalize EC301 -> EC0301 and EC013_2 -> EC013.
+        ec_suffix_match = re.fullmatch(r"(ec\d{2,4})_\d+", lower)
+        if ec_suffix_match:
+            lower = ec_suffix_match.group(1)
+        ec_match = re.fullmatch(r"ec(\d{2,4})", lower)
+        if ec_match:
+            digits = ec_match.group(1)
+            if len(digits) == 3 and int(digits) >= 300:
+                lower = f"ec0{digits}"
+            elif len(digits) == 2:
+                lower = f"ec0{digits}"
+            else:
+                lower = f"ec{digits}"
+
+        return lower
+
+    def _is_likely_sample_name(self, text: str) -> bool:
+        """Identify whether a method-file entry looks like a real sample."""
+        if text is None:
+            return False
+        name_lower = str(text).lower()
+        if "blank" in name_lower or "sdolek" in name_lower or "std" in name_lower:
+            return False
+        if self._extract_primary_sample_token(str(text)):
+            return True
+        return (
+            re.search(r"bc\d+", name_lower) is not None
+            or "qc" in name_lower
+            or "tissue" in name_lower
+            or "pooled" in name_lower
+        )
 
     def validate_input(self, df: pd.DataFrame) -> tuple:
         """
@@ -462,25 +566,22 @@ class DataOrganizer(BaseProcessor):
 
         fixed_cols, num_fixed = self._detect_fixed_columns_for_statistics(df)
         fixed_positions = list(range(num_fixed))
-        sample_positions = list(range(num_fixed, len(df.columns)))
+        sample_positions = [
+            idx for idx in range(num_fixed, len(df.columns))
+            if not self._is_non_sample_column(str(df.columns[idx]))
+        ]
+        metadata_positions = [
+            idx for idx in range(num_fixed, len(df.columns))
+            if self._is_non_sample_column(str(df.columns[idx]))
+        ]
 
         if not sample_positions:
             return df, stats
 
         filtered_injection_list: List[InjectionInfo] = []
         for info in injection_info_list:
-            name_lower = info.file_name.lower()
-            if "blank" in name_lower or "sdolek" in name_lower or "std" in name_lower:
-                continue
-            is_valid_sample = (
-                re.search(r"bc\d+", name_lower) is not None
-                or "qc" in name_lower
-                or "tissue" in name_lower
-                or "pooled" in name_lower
-            )
-            if not is_valid_sample:
-                continue
-            filtered_injection_list.append(info)
+            if self._is_likely_sample_name(info.file_name):
+                filtered_injection_list.append(info)
 
         if not filtered_injection_list:
             stats["columns_unmatched"] = len(sample_positions)
@@ -506,8 +607,13 @@ class DataOrganizer(BaseProcessor):
         stats["columns_reordered"] = len(ordered_positions) - len(available_positions)
         stats["columns_unmatched"] = len(available_positions)
 
-        reordered_df = df.iloc[:, fixed_positions + ordered_positions]
-        reordered_df.columns = fixed_cols + [df.columns[i] for i in ordered_positions]
+        new_positions = fixed_positions + ordered_positions + metadata_positions
+        reordered_df = df.iloc[:, new_positions]
+        reordered_df.columns = (
+            fixed_cols
+            + [df.columns[i] for i in ordered_positions]
+            + [df.columns[i] for i in metadata_positions]
+        )
         return reordered_df, stats
 
     def _find_matching_sample_column_position(
@@ -519,6 +625,12 @@ class DataOrganizer(BaseProcessor):
         """Find a matching sample column index for a method-file sample name."""
         file_lower = file_name.lower().replace("\n", " ")
         file_simplified = self._simplify_word_sample_name(file_name).lower()
+        file_keys = {
+            self._normalize_sample_key(file_name),
+            self._normalize_sample_key(file_simplified),
+            self._normalize_sample_key(self._extract_primary_sample_token(file_name) or ""),
+        }
+        file_keys = {k for k in file_keys if k}
 
         def detect_variant(text: str) -> str:
             text = text.lower().replace("\n", " ").replace("*", " ")
@@ -537,6 +649,15 @@ class DataOrganizer(BaseProcessor):
             col_raw = str(df.columns[pos])
             col_lower = col_raw.lower()
             col_key = self._extract_sample_name(col_raw).lower()
+            col_keys = {
+                self._normalize_sample_key(col_raw),
+                self._normalize_sample_key(col_key),
+                self._normalize_sample_key(self._extract_primary_sample_token(col_raw) or ""),
+            }
+            col_keys = {k for k in col_keys if k}
+
+            if file_keys and col_keys and file_keys.intersection(col_keys):
+                return pos
 
             bc_match_col = re.search(r"(tumor|normal|benign|benignfat)?(bc\d+)", col_key)
             bc_match_file = re.search(r"(tumor|normal|benign)\s*(tissue)?\s*(fat\s*)?(bc\d+)", file_lower)
@@ -679,6 +800,8 @@ class DataOrganizer(BaseProcessor):
         # Pattern: program2_program1_SAMPLENAME.tsv -> SAMPLENAME
         # Pattern: program2_1\\program2_program1_SAMPLENAME -> SAMPLENAME
         patterns_to_remove = [
+            r"^program\d+_(?:dna|rna)_program\d+_",  # program2_DNA_program1_
+            r"^(?:dna|rna)_program\d+_",  # DNA_program1_, RNA_program1_
             r"^program\d+_program\d+_",  # program2_program1_
             r"^program\d+_\d+_",  # program2_1_
             r"^program\d+_",  # program2_
@@ -826,6 +949,101 @@ class DataOrganizer(BaseProcessor):
 
         return tables
 
+    def _parse_injection_volume_from_cells(self, cells: List[str]) -> float:
+        """Parse likely injection volume from a table row."""
+        for cell in reversed(cells):
+            cell_text = str(cell).strip().replace(",", "")
+            if not cell_text:
+                continue
+            try:
+                value = float(cell_text)
+            except ValueError:
+                continue
+            if 0 < value <= 100:
+                return value
+        return 0.0
+
+    def _extract_injection_rows_from_table(
+        self,
+        table_rows: List[List[str]],
+        preserve_source_order: bool = False,
+    ) -> List[InjectionInfo]:
+        """
+        Extract injection rows from one table using common layouts.
+
+        Supported layouts:
+        - [Order, Sample, ...]
+        - [Order, Sample, ..., Order, Sample, ...] (dual-column Word table)
+        """
+        injections: List[InjectionInfo] = []
+        candidate_pairs = [(0, 1), (3, 4)]
+
+        for row in table_rows:
+            cells = [str(cell).strip() for cell in row]
+            if len(cells) < 2:
+                continue
+
+            for order_idx, sample_idx in candidate_pairs:
+                if len(cells) <= sample_idx:
+                    continue
+                order_text = cells[order_idx].strip() if len(cells) > order_idx else ""
+                if not re.fullmatch(r"\d{1,4}", order_text):
+                    continue
+
+                sample_cell = cells[sample_idx]
+                sample_token = self._extract_primary_sample_token(sample_cell)
+                if not sample_token:
+                    continue
+                sample_text = re.sub(r"\s+", " ", sample_cell).strip()
+                if not sample_text:
+                    sample_text = sample_token
+
+                instrument_method = ""
+                next_col = sample_idx + 1
+                if len(cells) > next_col:
+                    candidate = re.sub(r"\s+", " ", cells[next_col]).strip()
+                    if candidate and not candidate.isdigit():
+                        instrument_method = candidate
+
+                injection_volume = self._parse_injection_volume_from_cells(cells)
+                sample_name = self._simplify_word_sample_name(sample_text)
+
+                injections.append(
+                    InjectionInfo(
+                        injection_order=int(order_text),
+                        file_name=sample_text,
+                        sample_name=sample_name,
+                        injection_volume=injection_volume,
+                        instrument_method=instrument_method,
+                    )
+                )
+
+        if not injections:
+            return injections
+
+        if preserve_source_order:
+            deduped_source: List[InjectionInfo] = []
+            seen_keys = set()
+            for info in injections:
+                key = self._normalize_sample_key(info.file_name)
+                if not key or key in seen_keys:
+                    continue
+                seen_keys.add(key)
+                deduped_source.append(info)
+            for idx, info in enumerate(deduped_source, start=1):
+                info.injection_order = idx
+            return deduped_source
+
+        deduped: List[InjectionInfo] = []
+        seen = set()
+        for info in sorted(injections, key=lambda x: x.injection_order):
+            dedupe_key = (info.injection_order, self._normalize_sample_key(info.file_name))
+            if dedupe_key in seen:
+                continue
+            seen.add(dedupe_key)
+            deduped.append(info)
+        return deduped
+
     def _parse_injection_sequence(self, file_path: Union[str, Path]) -> List[InjectionInfo]:
         """
         Parse injection sequence table from Word document.
@@ -866,71 +1084,106 @@ class DataOrganizer(BaseProcessor):
             tables = self._extract_docx_tables_fallback(file_path)
 
         # Find the injection sequence table
-        # Look for table with columns: ID | File Name | Instrument Method | ...
+        # Look for table with columns similar to: ID | File Name | Instrument Method | ...
         target_table = None
         for table_rows in tables:
             if len(table_rows) > 10:  # Must have many rows
                 header_cells = [str(cell).strip().lower() for cell in table_rows[0]]
-                if any("file" in h and "name" in h for h in header_cells):
+                if any(
+                    ("file" in h and "name" in h)
+                    or ("filename" in h)
+                    or ("檔" in h)
+                    or ("樣本" in h)
+                    for h in header_cells
+                ):
                     target_table = table_rows
                     break
 
-        if target_table is None:
-            return injection_list
+        # Preferred parser: extract (order, sample) pairs directly from candidate table.
+        if target_table is not None:
+            parsed_from_target = self._extract_injection_rows_from_table(target_table)
+            if parsed_from_target:
+                # Some BC method sheets reuse numeric IDs across sections; in that case
+                # source-row order is a better approximation of true injection sequence.
+                order_values = [info.injection_order for info in parsed_from_target]
+                duplicate_orders = len(order_values) - len(set(order_values))
+                bc_like_count = sum(
+                    1 for info in parsed_from_target
+                    if re.search(r"bc\d+", info.file_name, re.IGNORECASE)
+                )
+                if duplicate_orders > 0 and bc_like_count >= 5:
+                    parsed_by_rows = self._extract_injection_rows_from_table(
+                        target_table,
+                        preserve_source_order=True,
+                    )
+                    if parsed_by_rows:
+                        return parsed_by_rows
+                return parsed_from_target
 
         # Parse the table using ROW ORDER (not ID column)
         # This handles Word tables where IDs may reset across pages
-        row_order = 0
-        for row_idx, row in enumerate(target_table):
-            if row_idx == 0:  # Skip header row
-                continue
-
-            cells = [str(cell).strip() for cell in row]
-            if len(cells) < 2:
-                continue
-
-            # Parse file name (sample name) - column 1
-            file_name = cells[1] if len(cells) > 1 else ""
-            # Normalize whitespace/newlines from Word tables
-            file_name = re.sub(r"\s+", " ", file_name).strip()
-            # Keep original underscores; only normalize whitespace
-            if not file_name:
-                continue
-
-            # Use row order as injection order (will be renumbered later)
-            row_order += 1
-
-            # Parse instrument method (column 2 or 3)
-            instrument_method = ""
-            for i in [2, 3]:
-                if len(cells) > i and "method" not in cells[i].lower():
-                    if cells[i] and not cells[i].isdigit():
-                        instrument_method = cells[i]
-                        break
-
-            # Parse injection volume (typically last numeric column)
-            injection_volume = 0.0
-            for cell in reversed(cells):
-                try:
-                    val = float(cell)
-                    if 0 < val <= 100:  # Reasonable injection volume
-                        injection_volume = val
-                        break
-                except ValueError:
+        if target_table is not None:
+            row_order = 0
+            for row_idx, row in enumerate(target_table):
+                if row_idx == 0:  # Skip header row
                     continue
 
-            # Extract simplified sample name
-            sample_name = self._simplify_word_sample_name(file_name)
+                cells = [str(cell).strip() for cell in row]
+                if len(cells) < 2:
+                    continue
 
-            injection_list.append(InjectionInfo(
-                injection_order=row_order,  # Use row order
-                file_name=file_name,
-                sample_name=sample_name,
-                injection_volume=injection_volume,
-                instrument_method=instrument_method,
-            ))
+                # Parse file name (sample name) - column 1
+                file_name = cells[1] if len(cells) > 1 else ""
+                # Normalize whitespace/newlines from Word tables
+                file_name = re.sub(r"\s+", " ", file_name).strip()
+                # Keep original underscores; only normalize whitespace
+                if not file_name:
+                    continue
 
-        return injection_list
+                # Use row order as injection order (will be renumbered later)
+                row_order += 1
+
+                # Parse instrument method (column 2 or 3)
+                instrument_method = ""
+                for i in [2, 3]:
+                    if len(cells) > i and "method" not in cells[i].lower():
+                        if cells[i] and not cells[i].isdigit():
+                            instrument_method = cells[i]
+                            break
+
+                injection_volume = self._parse_injection_volume_from_cells(cells)
+                sample_name = self._simplify_word_sample_name(file_name)
+
+                injection_list.append(
+                    InjectionInfo(
+                        injection_order=row_order,  # Use row order
+                        file_name=file_name,
+                        sample_name=sample_name,
+                        injection_volume=injection_volume,
+                        instrument_method=instrument_method,
+                    )
+                )
+            if injection_list:
+                return injection_list
+
+        # Fallback parser: score all tables and choose the one with the best
+        # (order, sample) extraction coverage.
+        best_list: List[InjectionInfo] = []
+        best_score: Tuple[int, int, int, int] = (-1, -1, -1, -1)
+        for table_rows in tables:
+            parsed = self._extract_injection_rows_from_table(table_rows)
+            if len(parsed) < 5:
+                continue
+
+            unique_orders = len({info.injection_order for info in parsed})
+            unique_samples = len({self._normalize_sample_key(info.file_name) for info in parsed})
+            duplicate_orders = len(parsed) - unique_orders
+            score = (unique_samples, unique_orders, -duplicate_orders, len(parsed))
+            if score > best_score:
+                best_score = score
+                best_list = parsed
+
+        return best_list
 
     def _simplify_word_sample_name(self, file_name: str) -> str:
         """
@@ -1008,8 +1261,9 @@ class DataOrganizer(BaseProcessor):
         # Determine number of fixed columns
         fixed_cols, num_fixed = detect_fixed_columns(df)
 
-        # Get sample columns (skip fixed columns)
-        sample_cols = list(df.columns[num_fixed:])
+        # Get sample columns (skip fixed columns and metadata-only columns)
+        all_trailing_cols = list(df.columns[num_fixed:])
+        sample_cols = [col for col in all_trailing_cols if not self._is_non_sample_column(str(col))]
 
         # Get Sample_Type row (first data row)
         sample_type_row = df.iloc[0]
@@ -1018,26 +1272,26 @@ class DataOrganizer(BaseProcessor):
         # Filter out blanks, standards, and non-sample entries
         filtered_injection_list = []
         for info in injection_info_list:
-            name_lower = info.file_name.lower()
-            # Skip blanks and standards
-            if "blank" in name_lower or "sdolek" in name_lower or "std" in name_lower:
-                continue
-            # Skip entries that don't look like samples (notes, comments, etc.)
-            # Valid samples should contain: BC ID, QC, or tissue keywords
-            is_valid_sample = (
-                re.search(r"bc\d+", name_lower) is not None or
-                "qc" in name_lower or
-                "tissue" in name_lower or
-                "pooled" in name_lower
-            )
-            if not is_valid_sample:
-                continue
-            filtered_injection_list.append(info)
+            if self._is_likely_sample_name(info.file_name):
+                filtered_injection_list.append(info)
 
         # Sort by original injection order and re-number starting from 1
         filtered_injection_list.sort(key=lambda x: x.injection_order)
         for new_order, info in enumerate(filtered_injection_list, start=1):
             info.injection_order = new_order
+
+        # Build fast lookup map from normalized keys to injection info
+        info_by_key: Dict[str, InjectionInfo] = {}
+        for info in filtered_injection_list:
+            keys = {
+                self._normalize_sample_key(info.file_name),
+                self._normalize_sample_key(info.sample_name),
+                self._normalize_sample_key(self._simplify_word_sample_name(info.file_name)),
+                self._normalize_sample_key(self._extract_primary_sample_token(info.file_name) or ""),
+            }
+            for key in keys:
+                if key and key not in info_by_key:
+                    info_by_key[key] = info
 
         # Build matching data
         sample_info_data = []
@@ -1057,39 +1311,50 @@ class DataOrganizer(BaseProcessor):
 
         for col in sample_cols:
             col_lower = col.lower()
+            col_keys = {
+                self._normalize_sample_key(col),
+                self._normalize_sample_key(self._extract_primary_sample_token(col) or ""),
+            }
+            col_keys = {k for k in col_keys if k}
+
             matched_info: Optional[InjectionInfo] = None
+            for key in col_keys:
+                if key in info_by_key:
+                    matched_info = info_by_key[key]
+                    break
 
-            for info in filtered_injection_list:
-                file_lower = info.file_name.lower().replace("\n", " ")
+            if matched_info is None:
+                for info in filtered_injection_list:
+                    file_lower = info.file_name.lower().replace("\n", " ")
 
-                # Match by BC ID with type prefix and variant (DNA/RNA/DNAandRNA)
-                bc_match_col = re.search(r"(tumor|normal|benign|benignfat)?(bc\d+)", col_lower)
-                bc_match_file = re.search(r"(tumor|normal|benign)\s*(tissue)?\s*(fat\s*)?(bc\d+)", file_lower)
+                    # Match by BC ID with type prefix and variant (DNA/RNA/DNAandRNA)
+                    bc_match_col = re.search(r"(tumor|normal|benign|benignfat)?(bc\d+)", col_lower)
+                    bc_match_file = re.search(r"(tumor|normal|benign)\s*(tissue)?\s*(fat\s*)?(bc\d+)", file_lower)
 
-                if bc_match_col and bc_match_file:
-                    col_prefix = bc_match_col.group(1) or ""
-                    col_id = bc_match_col.group(2)
-                    col_variant = detect_variant(col_lower)
+                    if bc_match_col and bc_match_file:
+                        col_prefix = bc_match_col.group(1) or ""
+                        col_id = bc_match_col.group(2)
+                        col_variant = detect_variant(col_lower)
 
-                    file_prefix = bc_match_file.group(1) or ""
-                    file_id = bc_match_file.group(4)
-                    file_variant = detect_variant(file_lower)
+                        file_prefix = bc_match_file.group(1) or ""
+                        file_id = bc_match_file.group(4)
+                        file_variant = detect_variant(file_lower)
 
-                    # Normalize prefix (benignfat -> benign)
-                    if "benign" in col_prefix:
-                        col_prefix = "benign"
+                        # Normalize prefix (benignfat -> benign)
+                        if "benign" in col_prefix:
+                            col_prefix = "benign"
 
-                    if col_id == file_id and col_prefix == file_prefix and col_variant == file_variant:
-                        matched_info = info
-                        break
+                        if col_id == file_id and col_prefix == file_prefix and col_variant == file_variant:
+                            matched_info = info
+                            break
 
-                # Match by QC number
-                qc_match_col = re.search(r"(pooled_?)?qc_?(\d+)", col_lower)
-                qc_match_file = re.search(r"(pooled_?)?qc_?(\d+)", file_lower)
-                if qc_match_col and qc_match_file:
-                    if qc_match_col.group(2) == qc_match_file.group(2):
-                        matched_info = info
-                        break
+                    # Match by QC number
+                    qc_match_col = re.search(r"(pooled_?)?qc_?(\d+)", col_lower)
+                    qc_match_file = re.search(r"(pooled_?)?qc_?(\d+)", file_lower)
+                    if qc_match_col and qc_match_file:
+                        if qc_match_col.group(2) == qc_match_file.group(2):
+                            matched_info = info
+                            break
 
             col_to_info_map[col] = matched_info
 
@@ -1150,8 +1415,10 @@ class DataOrganizer(BaseProcessor):
         # Determine fixed columns
         fixed_cols, num_fixed = detect_fixed_columns(df)
 
-        # Get sample columns
-        sample_cols = list(df.columns[num_fixed:])
+        # Split trailing columns into sample columns and metadata-only columns.
+        trailing_cols = list(df.columns[num_fixed:])
+        sample_cols = [col for col in trailing_cols if not self._is_non_sample_column(str(col))]
+        metadata_cols = [col for col in trailing_cols if self._is_non_sample_column(str(col))]
 
         # Use _col_name from SampleInfo if available (direct mapping)
         if "_col_name" in sample_info_df.columns:
@@ -1211,7 +1478,7 @@ class DataOrganizer(BaseProcessor):
                     ordered_sample_cols.append(col)
 
         # Rebuild DataFrame with new column order
-        new_column_order = fixed_cols + ordered_sample_cols
+        new_column_order = fixed_cols + ordered_sample_cols + metadata_cols
         return df[new_column_order]
 
     def _parse_method_file(self, file_path: Union[str, Path]) -> Dict[str, str]:
