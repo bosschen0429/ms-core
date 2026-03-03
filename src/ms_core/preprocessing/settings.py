@@ -67,6 +67,7 @@ class FeatureFilterConfig:
     default_background_threshold: float = 0.33
     default_skew_threshold: float = 0.66
     default_diff_threshold: float = 0.30
+    default_qc_ratio_threshold: float = 0.0
 
     # Excluded sample types (not included in analysis)
     excluded_types: list = field(default_factory=lambda: ["blank", "standard", "sdolek", "qc"])

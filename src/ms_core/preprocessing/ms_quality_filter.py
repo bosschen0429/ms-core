@@ -30,7 +30,7 @@ class FeatureFilter(BaseProcessor):
        - Stable: >=2 groups with ratio >= background threshold
        - Skewed: Any group with ratio >= skew threshold
        - Different: Any two groups with ratio difference >= diff threshold
-    4. Removes features with QC_ratio = 0
+    4. Removes features with QC_ratio = 0 or below threshold
     5. Imputes missing values using group-specific minimum/2
     """
 
@@ -71,6 +71,7 @@ class FeatureFilter(BaseProcessor):
         background_threshold: Optional[float] = None,
         skew_threshold: Optional[float] = None,
         diff_threshold: Optional[float] = None,
+        qc_ratio_threshold: Optional[float] = None,
         protected_rows: Optional[Set[int]] = None,
         **kwargs,
     ) -> ProcessingResult:
@@ -82,6 +83,7 @@ class FeatureFilter(BaseProcessor):
             background_threshold: Threshold for stable features (0-1)
             skew_threshold: Threshold for skewed features (0-1)
             diff_threshold: Threshold for differential features (0-1)
+            qc_ratio_threshold: Minimum QC_ratio to keep a feature (0-1)
             protected_rows: Set of row indices (red font) to protect from removal
             **kwargs: Additional parameters
 
@@ -94,6 +96,11 @@ class FeatureFilter(BaseProcessor):
         bg_thresh = background_threshold if background_threshold is not None else self.config.default_background_threshold
         skew_thresh = skew_threshold if skew_threshold is not None else self.config.default_skew_threshold
         diff_thresh = diff_threshold if diff_threshold is not None else self.config.default_diff_threshold
+        qc_ratio_thresh = (
+            qc_ratio_threshold
+            if qc_ratio_threshold is not None
+            else self.config.default_qc_ratio_threshold
+        )
 
         # Validate input
         is_valid, error_msg = self.validate_input(df)
@@ -134,6 +141,7 @@ class FeatureFilter(BaseProcessor):
                 bg_thresh,
                 skew_thresh,
                 diff_thresh,
+                qc_ratio_thresh,
                 protected_rows or set(),
             )
 
@@ -178,6 +186,7 @@ class FeatureFilter(BaseProcessor):
                         "background": bg_thresh,
                         "skew": skew_thresh,
                         "diff": diff_thresh,
+                        "qc_ratio": qc_ratio_thresh,
                     },
                     "deleted_features": deleted_features,
                     "blue_font_cells": impute_stats.get("imputed_cells", []),
@@ -304,6 +313,7 @@ class FeatureFilter(BaseProcessor):
         bg_threshold: float,
         skew_threshold: float,
         diff_threshold: float,
+        qc_ratio_threshold: float,
         protected_rows: Set[int],
     ) -> Tuple[pd.DataFrame, List[pd.Series], Dict[str, Any]]:
         """
@@ -318,6 +328,7 @@ class FeatureFilter(BaseProcessor):
             "stable_kept": 0,
             "diff_kept": 0,
             "qc_zero_deleted": 0,
+            "qc_low_deleted": 0,
             "protected_kept": 0,
         }
 
@@ -353,6 +364,12 @@ class FeatureFilter(BaseProcessor):
 
         # Rule: QC ratio == 0
         qc_zero = (qc_ratio == 0)
+        # Optional stricter gate: remove non-zero values below threshold
+        qc_low = (
+            (qc_ratio < qc_ratio_threshold) & (qc_ratio > 0)
+            if has_qc and qc_ratio_threshold > 0
+            else np.zeros(len(df) - 1, dtype=bool)
+        )
 
         # Conditions
         if ratio_matrix.shape[1] > 0:
@@ -367,8 +384,8 @@ class FeatureFilter(BaseProcessor):
             stable_keep = np.zeros(len(df) - 1, dtype=bool)
 
         keep_mask = protected_mask | skew_keep | diff_keep | stable_keep
-        # If QC ratio is zero and not protected, force delete
-        keep_mask = np.where(qc_zero & ~protected_mask, False, keep_mask)
+        # If QC ratio fails gate and not protected, force delete
+        keep_mask = np.where((qc_zero | qc_low) & ~protected_mask, False, keep_mask)
 
         # Update stats
         stats["protected_kept"] = int(protected_mask.sum())
@@ -376,6 +393,7 @@ class FeatureFilter(BaseProcessor):
         stats["diff_kept"] = int((diff_keep & ~protected_mask).sum())
         stats["stable_kept"] = int((stable_keep & ~protected_mask).sum())
         stats["qc_zero_deleted"] = int((qc_zero & ~protected_mask).sum())
+        stats["qc_low_deleted"] = int((qc_low & ~protected_mask).sum())
 
         # Build keep rows
         for i, keep in enumerate(keep_mask, start=1):

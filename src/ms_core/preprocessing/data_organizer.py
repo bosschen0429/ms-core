@@ -96,6 +96,73 @@ class DataOrganizer(BaseProcessor):
             return True
         return False
 
+    def _normalize_sample_type_value(self, value: Any) -> Optional[str]:
+        """Normalize sample type labels to toolkit's canonical values."""
+        if value is None or pd.isna(value):
+            return None
+        text = str(value).strip()
+        if not text:
+            return None
+
+        key = re.sub(r"[^a-z0-9]+", "", text.lower())
+        mapping = {
+            "qc": "QC",
+            "qualitycontrol": "QC",
+            "pooledqc": "QC",
+            "exposure": "Exposure",
+            "tumor": "Exposure",
+            "tumour": "Exposure",
+            "cancer": "Exposure",
+            "case": "Exposure",
+            "normal": "Normal",
+            "control": "Control",
+            "benign": "Control",
+            "benignfat": "Control",
+            "sample": "sample",
+            "blank": "blank",
+            "std": "standard",
+            "standard": "standard",
+            "sdolek": "standard",
+            "na": "na",
+        }
+        return mapping.get(key, text)
+
+    def _extract_sample_type_row_from_input(
+        self,
+        df: pd.DataFrame,
+    ) -> Tuple[pd.DataFrame, Dict[str, str], Dict[str, Any]]:
+        """
+        Extract user-provided Sample type row from raw input when present.
+
+        Expected marker is in the first row / first column (e.g., "Sample Type").
+        """
+        stats: Dict[str, Any] = {
+            "sample_types_from_input": False,
+            "input_sample_type_count": 0,
+        }
+        if df.empty:
+            return df, {}, stats
+
+        marker = str(df.iloc[0, 0]).strip().lower()
+        marker_compact = re.sub(r"[^a-z0-9]+", "", marker)
+        if marker_compact != "sampletype":
+            return df, {}, stats
+
+        provided_types: Dict[str, str] = {}
+        for col in df.columns[2:]:
+            col_str = str(col)
+            if self._is_non_sample_column(col_str):
+                continue
+            normalized = self._normalize_sample_type_value(df.iloc[0][col])
+            if normalized is None:
+                continue
+            provided_types[col_str] = normalized
+
+        cleaned_df = df.iloc[1:].reset_index(drop=True)
+        stats["sample_types_from_input"] = True
+        stats["input_sample_type_count"] = len(provided_types)
+        return cleaned_df, provided_types, stats
+
     def _extract_primary_sample_token(self, text: str) -> Optional[str]:
         """Extract a canonical sample token from free text."""
         if text is None:
@@ -273,6 +340,8 @@ class DataOrganizer(BaseProcessor):
                 "original_rows": len(df),
                 "original_cols": len(df.columns),
             }
+            result_df, input_sample_types, input_type_stats = self._extract_sample_type_row_from_input(result_df)
+            stats.update(input_type_stats)
 
             # Step 1: Parse method file if provided
             self.update_progress(10, "Parsing method file...")
@@ -305,6 +374,13 @@ class DataOrganizer(BaseProcessor):
             self.update_progress(50, "Simplifying column headers...")
             result_df, header_mapping = self._simplify_headers(result_df)
             stats["columns_simplified"] = len(header_mapping)
+            input_sample_types_simplified: Dict[str, str] = {}
+            if input_sample_types:
+                for raw_col, sample_type in input_sample_types.items():
+                    simplified = header_mapping.get(raw_col, self._extract_sample_name(str(raw_col)))
+                    normalized = self._normalize_sample_type_value(sample_type)
+                    if simplified and normalized and simplified not in input_sample_types_simplified:
+                        input_sample_types_simplified[simplified] = normalized
 
             if self._cancelled:
                 return ProcessingResult(success=False, message="Processing cancelled")
@@ -312,7 +388,10 @@ class DataOrganizer(BaseProcessor):
             # Step 4: Insert Sample_Type row
             self.update_progress(60, "Detecting sample types...")
             result_df, type_stats = self._insert_sample_type_row(
-                result_df, header_mapping, sample_mapping
+                result_df,
+                header_mapping,
+                sample_mapping,
+                sample_type_overrides=input_sample_types_simplified,
             )
             stats.update(type_stats)
 
@@ -399,6 +478,8 @@ class DataOrganizer(BaseProcessor):
                 "original_rows": len(df),
                 "original_cols": len(df.columns),
             }
+            result_df, input_sample_types, input_type_stats = self._extract_sample_type_row_from_input(result_df)
+            stats.update(input_type_stats)
             original_mz_col = str(df.columns[0])
             original_rt_col = str(df.columns[1])
             original_mz_values = result_df.iloc[:, 0].tolist()
@@ -438,6 +519,13 @@ class DataOrganizer(BaseProcessor):
             self.update_progress(50, "Simplifying column headers...")
             result_df, header_mapping = self._simplify_headers(result_df)
             stats["columns_simplified"] = len(header_mapping)
+            input_sample_types_simplified: Dict[str, str] = {}
+            if input_sample_types:
+                for raw_col, sample_type in input_sample_types.items():
+                    simplified = header_mapping.get(raw_col, self._extract_sample_name(str(raw_col)))
+                    normalized = self._normalize_sample_type_value(sample_type)
+                    if simplified and normalized and simplified not in input_sample_types_simplified:
+                        input_sample_types_simplified[simplified] = normalized
 
             if self._cancelled:
                 return ProcessingResult(success=False, message="Processing cancelled")
@@ -445,7 +533,10 @@ class DataOrganizer(BaseProcessor):
             # Step 4: Insert Sample_Type row
             self.update_progress(60, "Detecting sample types...")
             result_df, type_stats = self._insert_sample_type_row(
-                result_df, header_mapping, sample_mapping
+                result_df,
+                header_mapping,
+                sample_mapping,
+                sample_type_overrides=input_sample_types_simplified,
             )
             stats.update(type_stats)
 
@@ -824,22 +915,44 @@ class DataOrganizer(BaseProcessor):
         df: pd.DataFrame,
         header_mapping: Dict[str, str],
         sample_mapping: Dict[str, str],
+        sample_type_overrides: Optional[Dict[str, str]] = None,
     ) -> Tuple[pd.DataFrame, Dict[str, Any]]:
         """
         Insert Sample_Type row at the top of the data.
 
-        Auto-detects sample types based on column names.
+        Auto-detects sample types based on column names, unless user-provided
+        sample types are available from the input file.
         """
-        stats = {"types_detected": {}}
+        stats = {"types_detected": {}, "types_from_input": 0}
 
         # Determine number of fixed columns (Mz/RT only, or Mz/RT + Tolerance)
         fixed_cols, num_fixed = detect_fixed_columns(df)
 
         # Detect sample types
         sample_types = ["Sample_Type"] + ["na"] * (num_fixed - 1)  # Fixed columns
+        override_exact: Dict[str, str] = {}
+        override_by_key: Dict[str, str] = {}
+        if sample_type_overrides:
+            for col_name, sample_type in sample_type_overrides.items():
+                normalized = self._normalize_sample_type_value(sample_type)
+                if normalized is None:
+                    continue
+                exact_key = str(col_name)
+                override_exact[exact_key] = normalized
+                normalized_col_key = self._normalize_sample_key(exact_key)
+                if normalized_col_key and normalized_col_key not in override_by_key:
+                    override_by_key[normalized_col_key] = normalized
 
         for col in df.columns[num_fixed:]:
-            sample_type = self._detect_sample_type(col, sample_mapping)
+            sample_type = override_exact.get(str(col))
+            if sample_type is None:
+                col_key = self._normalize_sample_key(str(col))
+                if col_key:
+                    sample_type = override_by_key.get(col_key)
+            if sample_type is None:
+                sample_type = self._detect_sample_type(col, sample_mapping)
+            else:
+                stats["types_from_input"] += 1
             sample_types.append(sample_type)
 
             # Track statistics
