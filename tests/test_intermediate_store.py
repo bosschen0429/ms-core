@@ -37,3 +37,21 @@ def test_save_parquet_cache_default_enabled() -> None:
     from ms_core.preprocessing.settings import Settings
 
     assert Settings.SAVE_PARQUET_CACHE is True
+
+
+def test_intermediate_store_save_handles_mixed_object_columns() -> None:
+    from ms_core.utils.intermediate_store import IntermediateStore
+
+    df = pd.DataFrame(
+        {
+            "MZ": ["Sample_Type", 123.456],
+            "RT": ["Tolerance", 1.5],
+        }
+    )
+
+    with TemporaryDirectory(dir=Path.cwd()) as temp_dir:
+        parquet_path = Path(temp_dir) / "mixed.parquet"
+        IntermediateStore.save(df=df, parquet_path=parquet_path, metadata={})
+        loaded_df, _ = IntermediateStore.load(parquet_path=parquet_path)
+
+    assert loaded_df.shape == df.shape
