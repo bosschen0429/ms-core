@@ -487,6 +487,8 @@ class FeatureFilter(BaseProcessor):
                 continue
             pos = [col_pos[c] for c in col_indices]
             block = block_values[:, pos]
+            if block.shape[0] == 0:
+                continue
             missing_nan_mask = np.isnan(block)
             missing_zero_mask = (block == 0)
             missing_mask = missing_nan_mask | missing_zero_mask
@@ -496,7 +498,7 @@ class FeatureFilter(BaseProcessor):
             block_positive = np.where(block > 0, block, np.nan)
             # Avoid RuntimeWarning on all-NaN rows by using +inf sentinel.
             mins = np.min(np.where(np.isnan(block_positive), np.inf, block_positive), axis=1)
-            mins = np.where(np.isinf(mins), 0, mins)
+            mins = np.where(np.isinf(mins), signal_threshold, mins)
 
             special = special_case[group_name]
             fill_values = np.where(special, signal_threshold, mins / 2)
@@ -520,27 +522,28 @@ class FeatureFilter(BaseProcessor):
         if qc_cols:
             pos = [col_pos[c] for c in qc_cols]
             block = block_values[:, pos]
-            missing_nan_mask = np.isnan(block)
-            missing_zero_mask = (block == 0)
-            missing_mask = missing_nan_mask | missing_zero_mask
-            if missing_mask.any():
-                block_positive = np.where(block > 0, block, np.nan)
-                qc_mins = np.min(np.where(np.isnan(block_positive), np.inf, block_positive), axis=1)
-                qc_mins = np.where(np.isinf(qc_mins), 0, qc_mins)
-                fill_values = (qc_mins / 2)[:, None]
-                filled = np.where(missing_mask, fill_values, block)
-                block_values[:, pos] = filled
+            if block.shape[0] > 0:
+                missing_nan_mask = np.isnan(block)
+                missing_zero_mask = (block == 0)
+                missing_mask = missing_nan_mask | missing_zero_mask
+                if missing_mask.any():
+                    block_positive = np.where(block > 0, block, np.nan)
+                    qc_mins = np.min(np.where(np.isnan(block_positive), np.inf, block_positive), axis=1)
+                    qc_mins = np.where(np.isinf(qc_mins), signal_threshold, qc_mins)
+                    fill_values = (qc_mins / 2)[:, None]
+                    filled = np.where(missing_mask, fill_values, block)
+                    block_values[:, pos] = filled
 
-                idx = np.argwhere(missing_mask)
-                if idx.size > 0:
-                    rows = (idx[:, 0] + 1).astype(int).tolist()
-                    cols = [qc_cols[j] for j in idx[:, 1].tolist()]
-                    imputed_cells.extend(list(zip(rows, cols)))
-                    nan_count = int(missing_nan_mask.sum())
-                    zero_count = int(missing_zero_mask.sum())
-                    stats["cells_imputed"] += (nan_count + zero_count)
-                    stats["cells_imputed_from_nan"] += nan_count
-                    stats["cells_imputed_from_zero"] += zero_count
+                    idx = np.argwhere(missing_mask)
+                    if idx.size > 0:
+                        rows = (idx[:, 0] + 1).astype(int).tolist()
+                        cols = [qc_cols[j] for j in idx[:, 1].tolist()]
+                        imputed_cells.extend(list(zip(rows, cols)))
+                        nan_count = int(missing_nan_mask.sum())
+                        zero_count = int(missing_zero_mask.sum())
+                        stats["cells_imputed"] += (nan_count + zero_count)
+                        stats["cells_imputed_from_nan"] += nan_count
+                        stats["cells_imputed_from_zero"] += zero_count
 
         # Write back to DataFrame
         if all_cols:
