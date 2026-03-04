@@ -17,6 +17,7 @@ from openpyxl import load_workbook
 from openpyxl.styles import Font, PatternFill, Color
 
 from ms_core.preprocessing.settings import Settings
+from ms_core.utils.intermediate_store import IntermediateStore
 
 logger = logging.getLogger(__name__)
 
@@ -87,12 +88,18 @@ class FileHandler:
             df = self._load_delimited(path, header_row, sep="\t")
             metadata["format"] = "tsv"
         elif suffix == ".parquet":
-            df = pd.read_parquet(path)
             metadata["format"] = "parquet"
-            meta = self._load_parquet_meta(path)
-            if meta:
-                metadata.update(meta)
-                red_font_rows = set(meta.get("red_font_rows", []))
+            try:
+                df, store_meta = IntermediateStore.load(path)
+                metadata.update(store_meta)
+                red_font_rows = set(store_meta.get("red_font_rows", []))
+            except Exception as exc:
+                logger.warning("Intermediate store load failed, falling back to legacy parquet loader: %s", exc)
+                df = pd.read_parquet(path)
+                meta = self._load_parquet_meta(path)
+                if meta:
+                    metadata.update(meta)
+                    red_font_rows = set(meta.get("red_font_rows", []))
         else:
             raise ValueError(f"Unsupported file format: {suffix}")
 
@@ -205,7 +212,21 @@ class FileHandler:
         elif suffix in {".tsv", ".txt"}:
             df.to_csv(path, sep="\t", index=index)
         elif suffix == ".parquet":
-            df.to_parquet(path, index=index)
+            parquet_meta = {
+                "red_font_rows": sorted(red_font_rows) if red_font_rows else [],
+                "blue_font_cells": blue_font_cells or [],
+                "highlight_rows": sorted(highlight_rows) if highlight_rows else [],
+            }
+            try:
+                IntermediateStore.save(
+                    df=df,
+                    parquet_path=path,
+                    metadata=parquet_meta,
+                    index=index,
+                )
+            except Exception as exc:
+                logger.warning("Intermediate store save failed, falling back to raw parquet write: %s", exc)
+                df.to_parquet(path, index=index)
         else:
             # Default to Excel format
             path = path.with_suffix(".xlsx")
@@ -317,6 +338,23 @@ class FileHandler:
         red_font_rows: Optional[set] = None,
     ) -> None:
         """Save a parquet cache with metadata sidecar for formatting."""
+        meta = {
+            "red_font_rows": sorted(red_font_rows) if red_font_rows else [],
+            "blue_font_cells": blue_font_cells or [],
+            "highlight_rows": sorted(highlight_rows) if highlight_rows else [],
+        }
+
+        try:
+            IntermediateStore.save(
+                df=df,
+                parquet_path=parquet_path,
+                metadata=meta,
+                index=False,
+            )
+            return
+        except Exception as exc:
+            logger.debug("Intermediate store cache save failed; using legacy fallback: %s", exc)
+
         if df.columns.duplicated().any():
             logger.debug("Skipping parquet cache because dataframe has duplicate column labels.")
             return
@@ -330,11 +368,6 @@ class FileHandler:
             )
             normalized_df = self._normalize_for_parquet(df)
             normalized_df.to_parquet(parquet_path, index=False)
-        meta = {
-            "red_font_rows": sorted(red_font_rows) if red_font_rows else [],
-            "blue_font_cells": blue_font_cells or [],
-            "highlight_rows": sorted(highlight_rows) if highlight_rows else [],
-        }
         meta_path = self._parquet_meta_path(parquet_path)
         try:
             meta_path.write_text(json.dumps(meta, ensure_ascii=False), encoding="utf-8")

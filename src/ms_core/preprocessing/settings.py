@@ -105,7 +105,7 @@ class Settings:
 
     # Supported file formats (canonical source ??used by FileHandler too)
     SUPPORTED_FORMATS = frozenset({".xlsx", ".xls", ".csv", ".tsv", ".txt", ".parquet"})
-    # Keep output folder clean by default; only emit final Excel artifacts.
+    # Enable parquet intermediates by default for Step1-4 chaining performance.
     SAVE_PARQUET_CACHE = True
 
     # GUI Settings
