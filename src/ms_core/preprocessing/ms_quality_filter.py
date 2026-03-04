@@ -190,6 +190,11 @@ class FeatureFilter(BaseProcessor):
                     },
                     "deleted_features": deleted_features,
                     "blue_font_cells": impute_stats.get("imputed_cells", []),
+                    "imputation_stats": {
+                        "cells_imputed": int(impute_stats.get("cells_imputed", 0)),
+                        "cells_imputed_from_nan": int(impute_stats.get("cells_imputed_from_nan", 0)),
+                        "cells_imputed_from_zero": int(impute_stats.get("cells_imputed_from_zero", 0)),
+                    },
                     "red_font_rows": filter_stats.get("red_font_rows", []),
                     "protected_rows": filter_stats.get("red_font_rows", []),
                 },
