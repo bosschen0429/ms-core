@@ -434,6 +434,8 @@ class FeatureFilter(BaseProcessor):
         """
         stats = {
             "cells_imputed": 0,
+            "cells_imputed_from_nan": 0,
+            "cells_imputed_from_zero": 0,
             "imputation_method": "group_min_half",
         }
 
@@ -485,7 +487,9 @@ class FeatureFilter(BaseProcessor):
                 continue
             pos = [col_pos[c] for c in col_indices]
             block = block_values[:, pos]
-            missing_mask = np.isnan(block)
+            missing_nan_mask = np.isnan(block)
+            missing_zero_mask = (block == 0)
+            missing_mask = missing_nan_mask | missing_zero_mask
             if not missing_mask.any():
                 continue
 
@@ -505,14 +509,20 @@ class FeatureFilter(BaseProcessor):
                 rows = (idx[:, 0] + 1).astype(int).tolist()
                 cols = [col_indices[j] for j in idx[:, 1].tolist()]
                 imputed_cells.extend(list(zip(rows, cols)))
-                stats["cells_imputed"] += int(len(rows))
+                nan_count = int(missing_nan_mask.sum())
+                zero_count = int(missing_zero_mask.sum())
+                stats["cells_imputed"] += (nan_count + zero_count)
+                stats["cells_imputed_from_nan"] += nan_count
+                stats["cells_imputed_from_zero"] += zero_count
 
         # Impute QC columns in blocks
         qc_cols = group_info.get("qc_cols", [])
         if qc_cols:
             pos = [col_pos[c] for c in qc_cols]
             block = block_values[:, pos]
-            missing_mask = np.isnan(block)
+            missing_nan_mask = np.isnan(block)
+            missing_zero_mask = (block == 0)
+            missing_mask = missing_nan_mask | missing_zero_mask
             if missing_mask.any():
                 block_positive = np.where(block > 0, block, np.nan)
                 qc_mins = np.min(np.where(np.isnan(block_positive), np.inf, block_positive), axis=1)
@@ -526,7 +536,11 @@ class FeatureFilter(BaseProcessor):
                     rows = (idx[:, 0] + 1).astype(int).tolist()
                     cols = [qc_cols[j] for j in idx[:, 1].tolist()]
                     imputed_cells.extend(list(zip(rows, cols)))
-                    stats["cells_imputed"] += int(len(rows))
+                    nan_count = int(missing_nan_mask.sum())
+                    zero_count = int(missing_zero_mask.sum())
+                    stats["cells_imputed"] += (nan_count + zero_count)
+                    stats["cells_imputed_from_nan"] += nan_count
+                    stats["cells_imputed_from_zero"] += zero_count
 
         # Write back to DataFrame
         if all_cols:
