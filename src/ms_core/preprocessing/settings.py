@@ -1,4 +1,4 @@
-"""
+﻿"""
 Configuration settings for MS Preprocessing Toolkit.
 
 This module defines all configurable parameters and default values
@@ -103,10 +103,10 @@ class Settings:
     for the MS Preprocessing Toolkit.
     """
 
-    # Supported file formats (canonical source — used by FileHandler too)
+    # Supported file formats (canonical source ??used by FileHandler too)
     SUPPORTED_FORMATS = frozenset({".xlsx", ".xls", ".csv", ".tsv", ".txt", ".parquet"})
     # Keep output folder clean by default; only emit final Excel artifacts.
-    SAVE_PARQUET_CACHE = False
+    SAVE_PARQUET_CACHE = True
 
     # GUI Settings
     WINDOW_TITLE = "MS Preprocessing Toolkit"
@@ -115,10 +115,10 @@ class Settings:
 
     # Workflow steps
     WORKFLOW_STEPS = [
-        ("data_organizer", "資料整理", "Data Organization"),
-        ("istd_marker", "ISTD 標記", "ISTD Marking"),
-        ("duplicate_remover", "重複訊號刪除", "Duplicate Removal"),
-        ("feature_filter", "篩選與填補", "Feature Filtering"),
+        ("data_organizer", "鞈??渡?", "Data Organization"),
+        ("istd_marker", "ISTD 璅?", "ISTD Marking"),
+        ("duplicate_remover", "??閮??芷", "Duplicate Removal"),
+        ("feature_filter", "Feature Filtering", "Feature Filtering"),
     ]
 
     def __init__(self, config: Optional[ProcessingConfig] = None):
@@ -146,3 +146,5 @@ class Settings:
         for key, value in kwargs.items():
             if hasattr(self.config, key):
                 setattr(self.config, key, value)
+
+
