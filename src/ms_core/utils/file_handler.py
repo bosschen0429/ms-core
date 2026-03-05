@@ -6,6 +6,7 @@ commonly used in mass spectrometry data processing.
 """
 
 import logging
+import hashlib
 from pathlib import Path
 from typing import Optional, Union, Tuple, Any
 from datetime import datetime
@@ -200,7 +201,7 @@ class FileHandler:
                 try:
                     self._save_parquet_cache(
                         df,
-                        path.with_suffix(".parquet"),
+                        self._cache_path_for_excel(path),
                         highlight_rows=highlight_rows,
                         blue_font_cells=blue_font_cells,
                         red_font_rows=red_font_rows,
@@ -329,6 +330,16 @@ class FileHandler:
     def _parquet_meta_path(parquet_path: Path) -> Path:
         return parquet_path.with_suffix(parquet_path.suffix + ".meta.json")
 
+    @staticmethod
+    def _cache_path_for_excel(excel_path: Path) -> Path:
+        """Map an excel path to a machine-local cache parquet path."""
+        normalized = str(excel_path.resolve(strict=False)).lower()
+        digest = hashlib.sha1(normalized.encode("utf-8")).hexdigest()
+        cache_root = Settings.get_parquet_cache_root()
+        safe_stem = "".join(ch if ch.isalnum() or ch in {"-", "_"} else "_" for ch in excel_path.stem) or "dataset"
+        filename = f"{safe_stem}_{digest}.parquet"
+        return cache_root / digest[:2] / filename
+
     def _save_parquet_cache(
         self,
         df: pd.DataFrame,
@@ -338,6 +349,7 @@ class FileHandler:
         red_font_rows: Optional[set] = None,
     ) -> None:
         """Save a parquet cache with metadata sidecar for formatting."""
+        parquet_path.parent.mkdir(parents=True, exist_ok=True)
         meta = {
             "red_font_rows": sorted(red_font_rows) if red_font_rows else [],
             "blue_font_cells": blue_font_cells or [],
@@ -393,7 +405,7 @@ class FileHandler:
 
     def _resolve_parquet_cache(self, excel_path: Path) -> Optional[Path]:
         """Return parquet cache if it exists and is newer than Excel."""
-        parquet_path = excel_path.with_suffix(".parquet")
+        parquet_path = self._cache_path_for_excel(excel_path)
         meta_path = self._parquet_meta_path(parquet_path)
         if not parquet_path.exists() or not meta_path.exists():
             return None

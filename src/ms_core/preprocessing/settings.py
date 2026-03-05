@@ -8,6 +8,8 @@ used throughout the preprocessing pipeline.
 from dataclasses import dataclass, field
 from typing import Optional
 from pathlib import Path
+import os
+import tempfile
 
 
 @dataclass
@@ -107,6 +109,8 @@ class Settings:
     SUPPORTED_FORMATS = frozenset({".xlsx", ".xls", ".csv", ".tsv", ".txt", ".parquet"})
     # Enable parquet intermediates by default for Step1-4 chaining performance.
     SAVE_PARQUET_CACHE = True
+    PARQUET_CACHE_ROOT_ENV = "MSPTK_PARQUET_CACHE_ROOT"
+    PARQUET_CACHE_DIRNAME = "ms-preprocessing-toolkit/cache"
 
     # GUI Settings
     WINDOW_TITLE = "MS Preprocessing Toolkit"
@@ -146,5 +150,18 @@ class Settings:
         for key, value in kwargs.items():
             if hasattr(self.config, key):
                 setattr(self.config, key, value)
+
+    @classmethod
+    def get_parquet_cache_root(cls) -> Path:
+        """Resolve machine-local parquet cache root."""
+        override = os.getenv(cls.PARQUET_CACHE_ROOT_ENV)
+        if override:
+            return Path(override)
+
+        local_app_data = os.getenv("LOCALAPPDATA")
+        if local_app_data:
+            return Path(local_app_data) / cls.PARQUET_CACHE_DIRNAME
+
+        return Path(tempfile.gettempdir()) / cls.PARQUET_CACHE_DIRNAME
 
 
