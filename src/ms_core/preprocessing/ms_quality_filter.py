@@ -482,7 +482,7 @@ class FeatureFilter(BaseProcessor):
         col_pos = {col_idx: pos for pos, col_idx in enumerate(all_cols)}
         if all_cols:
             block_all = df.iloc[1:, all_cols].apply(pd.to_numeric, errors="coerce")
-            block_values = block_all.to_numpy()
+            block_values = block_all.to_numpy(copy=True)
         else:
             block_values = np.zeros((len(df) - 1, 0))
 
