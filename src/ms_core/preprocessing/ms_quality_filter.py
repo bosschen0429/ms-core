@@ -550,9 +550,11 @@ class FeatureFilter(BaseProcessor):
                         stats["cells_imputed_from_nan"] += nan_count
                         stats["cells_imputed_from_zero"] += zero_count
 
-        # Write back to DataFrame
+        # Write back to DataFrame — assign column-by-column to avoid
+        # pandas 2.x StringDtype rejection on mixed-type columns.
         if all_cols:
-            df.iloc[1:, all_cols] = block_values
+            for i, col_idx in enumerate(all_cols):
+                df.iloc[1:, col_idx] = block_values[:, i]
 
         stats["imputed_cells"] = imputed_cells
 
