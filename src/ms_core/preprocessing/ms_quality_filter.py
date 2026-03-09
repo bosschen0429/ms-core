@@ -415,8 +415,8 @@ class FeatureFilter(BaseProcessor):
             row_mapping[idx] for idx in protected_rows if idx in row_mapping
         )
 
-        # Filter DataFrame
-        result_df = df.iloc[rows_to_keep].reset_index(drop=True)
+        # Filter DataFrame — .copy() ensures writable backing array (avoids numpy read-only error)
+        result_df = df.iloc[rows_to_keep].reset_index(drop=True).copy()
 
         return result_df, deleted_features, stats
 
