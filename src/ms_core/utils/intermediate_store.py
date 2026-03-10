@@ -88,14 +88,17 @@ class IntermediateStore:
                 continue
 
             if non_null.map(lambda v: isinstance(v, (bytes, bytearray))).all():
-                normalized.iloc[:, idx] = series.map(IntermediateStore._decode_bytes).to_numpy()
+                col_name = normalized.columns[idx]
+                normalized[col_name] = series.map(IntermediateStore._decode_bytes).to_list()
                 continue
 
             if non_null.map(lambda v: isinstance(v, (int, float, bool, np.number, np.bool_))).all():
-                normalized.iloc[:, idx] = pd.to_numeric(series, errors="coerce").to_numpy()
+                col_name = normalized.columns[idx]
+                normalized[col_name] = pd.to_numeric(series, errors="coerce").to_list()
                 continue
 
-            normalized.iloc[:, idx] = series.map(IntermediateStore._stringify_mixed_value).to_numpy()
+            col_name = normalized.columns[idx]
+            normalized[col_name] = series.map(IntermediateStore._stringify_mixed_value).to_list()
 
         return normalized
 

@@ -1022,7 +1022,12 @@ class DataOrganizer(BaseProcessor):
             sample_col_positions = list(range(num_fixed, len(df.columns)))
             data_block = df.iloc[1:, sample_col_positions]
             converted = data_block.apply(pd.to_numeric, errors="coerce")
-            df.iloc[1:, sample_col_positions] = converted.to_numpy()
+            conv_values = converted.to_numpy()
+            # Rebuild each column as a Python list so pandas 3.x
+            # StringDtype columns are replaced with object dtype.
+            for j, col_pos in enumerate(sample_col_positions):
+                col_name = df.columns[col_pos]
+                df[col_name] = [df.iat[0, col_pos]] + conv_values[:, j].tolist()
 
         return df
 

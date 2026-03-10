@@ -443,16 +443,19 @@ class FileHandler:
 
             if non_null.map(lambda v: isinstance(v, (bytes, bytearray))).all():
                 converted = series.map(FileHandler._decode_bytes_value)
-                normalized.iloc[:, col_idx] = converted.to_numpy()
+                col_name = normalized.columns[col_idx]
+                normalized[col_name] = converted.to_list()
                 continue
 
             if non_null.map(lambda v: isinstance(v, (int, float, bool, np.number, np.bool_))).all():
                 converted = pd.to_numeric(series, errors="coerce")
-                normalized.iloc[:, col_idx] = converted.to_numpy()
+                col_name = normalized.columns[col_idx]
+                normalized[col_name] = converted.to_list()
                 continue
 
             converted = series.map(FileHandler._stringify_mixed_value)
-            normalized.iloc[:, col_idx] = converted.to_numpy()
+            col_name = normalized.columns[col_idx]
+            normalized[col_name] = converted.to_list()
 
         return normalized
 
