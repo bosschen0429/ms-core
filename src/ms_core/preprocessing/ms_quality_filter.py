@@ -72,6 +72,10 @@ class FeatureFilter(BaseProcessor):
         skew_threshold: Optional[float] = None,
         diff_threshold: Optional[float] = None,
         qc_ratio_threshold: Optional[float] = None,
+        enable_background_threshold: bool = True,
+        enable_skew_threshold: bool = True,
+        enable_diff_threshold: bool = True,
+        enable_qc_ratio_threshold: bool = True,
         protected_rows: Optional[Set[int]] = None,
         **kwargs,
     ) -> ProcessingResult:
@@ -84,6 +88,10 @@ class FeatureFilter(BaseProcessor):
             skew_threshold: Threshold for skewed features (0-1)
             diff_threshold: Threshold for differential features (0-1)
             qc_ratio_threshold: Minimum QC_ratio to keep a feature (0-1)
+            enable_background_threshold: Whether to apply stable feature rule
+            enable_skew_threshold: Whether to apply skewed feature rule
+            enable_diff_threshold: Whether to apply differential feature rule
+            enable_qc_ratio_threshold: Whether to apply QC-based deletion rules
             protected_rows: Set of row indices (red font) to protect from removal
             **kwargs: Additional parameters
 
@@ -142,6 +150,10 @@ class FeatureFilter(BaseProcessor):
                 skew_thresh,
                 diff_thresh,
                 qc_ratio_thresh,
+                enable_background_threshold,
+                enable_skew_threshold,
+                enable_diff_threshold,
+                enable_qc_ratio_threshold,
                 protected_rows or set(),
             )
 
@@ -187,6 +199,12 @@ class FeatureFilter(BaseProcessor):
                         "skew": skew_thresh,
                         "diff": diff_thresh,
                         "qc_ratio": qc_ratio_thresh,
+                    },
+                    "enabled_thresholds": {
+                        "background": bool(enable_background_threshold),
+                        "skew": bool(enable_skew_threshold),
+                        "diff": bool(enable_diff_threshold),
+                        "qc_ratio": bool(enable_qc_ratio_threshold),
                     },
                     "deleted_features": deleted_features,
                     "blue_font_cells": impute_stats.get("imputed_cells", []),
@@ -319,6 +337,10 @@ class FeatureFilter(BaseProcessor):
         skew_threshold: float,
         diff_threshold: float,
         qc_ratio_threshold: float,
+        enable_background_threshold: bool,
+        enable_skew_threshold: bool,
+        enable_diff_threshold: bool,
+        enable_qc_ratio_threshold: bool,
         protected_rows: Set[int],
     ) -> Tuple[pd.DataFrame, List[pd.Series], Dict[str, Any]]:
         """
@@ -367,28 +389,54 @@ class FeatureFilter(BaseProcessor):
             if idx > 0 and idx < len(df):
                 protected_mask[idx - 1] = True
 
-        # Rule: QC ratio == 0
-        qc_zero = (qc_ratio == 0)
-        # Optional stricter gate: remove non-zero values below threshold
-        qc_low = (
-            (qc_ratio < qc_ratio_threshold) & (qc_ratio > 0)
-            if has_qc and qc_ratio_threshold > 0
-            else np.zeros(len(df) - 1, dtype=bool)
-        )
+        if enable_qc_ratio_threshold:
+            qc_zero = (qc_ratio == 0)
+            qc_low = (
+                (qc_ratio < qc_ratio_threshold) & (qc_ratio > 0)
+                if has_qc and qc_ratio_threshold > 0
+                else np.zeros(len(df) - 1, dtype=bool)
+            )
+        else:
+            qc_zero = np.zeros(len(df) - 1, dtype=bool)
+            qc_low = np.zeros(len(df) - 1, dtype=bool)
 
         # Conditions
         if ratio_matrix.shape[1] > 0:
-            skew_keep = (ratio_matrix >= skew_threshold).any(axis=1)
+            skew_keep = (
+                (ratio_matrix >= skew_threshold).any(axis=1)
+                if enable_skew_threshold
+                else np.zeros(len(df) - 1, dtype=bool)
+            )
             # Max diff across groups
             max_diff = ratio_matrix.max(axis=1) - ratio_matrix.min(axis=1)
-            diff_keep = max_diff >= diff_threshold if ratio_matrix.shape[1] >= 2 else np.zeros(len(df) - 1, dtype=bool)
-            stable_keep = (ratio_matrix >= bg_threshold).sum(axis=1) >= 2
+            diff_keep = (
+                max_diff >= diff_threshold
+                if enable_diff_threshold and ratio_matrix.shape[1] >= 2
+                else np.zeros(len(df) - 1, dtype=bool)
+            )
+            stable_keep = (
+                (ratio_matrix >= bg_threshold).sum(axis=1) >= 2
+                if enable_background_threshold
+                else np.zeros(len(df) - 1, dtype=bool)
+            )
         else:
             skew_keep = np.zeros(len(df) - 1, dtype=bool)
             diff_keep = np.zeros(len(df) - 1, dtype=bool)
             stable_keep = np.zeros(len(df) - 1, dtype=bool)
 
-        keep_mask = protected_mask | skew_keep | diff_keep | stable_keep
+        positive_rules = []
+        if enable_skew_threshold:
+            positive_rules.append(skew_keep)
+        if enable_diff_threshold:
+            positive_rules.append(diff_keep)
+        if enable_background_threshold:
+            positive_rules.append(stable_keep)
+
+        if positive_rules:
+            keep_mask = protected_mask | np.logical_or.reduce(positive_rules)
+        else:
+            keep_mask = np.ones(len(df) - 1, dtype=bool)
+
         # If QC ratio fails gate and not protected, force delete
         keep_mask = np.where((qc_zero | qc_low) & ~protected_mask, False, keep_mask)
 
