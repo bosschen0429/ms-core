@@ -550,12 +550,13 @@ class FeatureFilter(BaseProcessor):
                         stats["cells_imputed_from_nan"] += nan_count
                         stats["cells_imputed_from_zero"] += zero_count
 
-        # Write back to DataFrame — coerce each column to object first so
-        # pandas 3.x StringDtype columns accept numeric values.
+        # Write back to DataFrame — rebuild each column as a Python list
+        # so that pandas 3.x StringDtype columns are replaced with object
+        # dtype columns that accept numeric values.
         if all_cols:
             for i, col_idx in enumerate(all_cols):
-                df.iloc[:, col_idx] = df.iloc[:, col_idx].astype(object)
-                df.iloc[1:, col_idx] = block_values[:, i]
+                col_name = df.columns[col_idx]
+                df[col_name] = [df.iat[0, col_idx]] + block_values[:, i].tolist()
 
         stats["imputed_cells"] = imputed_cells
 
