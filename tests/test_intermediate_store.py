@@ -2,12 +2,12 @@
 
 from __future__ import annotations
 
-import pandas as pd
 from pathlib import Path
-from tempfile import TemporaryDirectory
+
+import pandas as pd
 
 
-def test_intermediate_store_roundtrip_preserves_metadata() -> None:
+def test_intermediate_store_roundtrip_preserves_metadata(project_temp_dir) -> None:
     from ms_core.utils.intermediate_store import IntermediateStore
 
     df = pd.DataFrame(
@@ -23,8 +23,8 @@ def test_intermediate_store_roundtrip_preserves_metadata() -> None:
         "sample_info_ref": "sample_info.xlsx",
         "deleted_feature_ref": "deleted_feature.xlsx",
     }
-    with TemporaryDirectory(dir=Path.cwd()) as temp_dir:
-        parquet_path = Path(temp_dir) / "step1.parquet"
+    with project_temp_dir() as temp_dir:
+        parquet_path = temp_dir / "step1.parquet"
         IntermediateStore.save(df=df, parquet_path=parquet_path, metadata=metadata)
         loaded_df, loaded_metadata = IntermediateStore.load(parquet_path=parquet_path)
 
@@ -39,7 +39,7 @@ def test_save_parquet_cache_default_enabled() -> None:
     assert Settings.SAVE_PARQUET_CACHE is True
 
 
-def test_intermediate_store_save_handles_mixed_object_columns() -> None:
+def test_intermediate_store_save_handles_mixed_object_columns(project_temp_dir) -> None:
     from ms_core.utils.intermediate_store import IntermediateStore
 
     df = pd.DataFrame(
@@ -49,8 +49,8 @@ def test_intermediate_store_save_handles_mixed_object_columns() -> None:
         }
     )
 
-    with TemporaryDirectory(dir=Path.cwd()) as temp_dir:
-        parquet_path = Path(temp_dir) / "mixed.parquet"
+    with project_temp_dir() as temp_dir:
+        parquet_path = temp_dir / "mixed.parquet"
         IntermediateStore.save(df=df, parquet_path=parquet_path, metadata={})
         loaded_df, _ = IntermediateStore.load(parquet_path=parquet_path)
 

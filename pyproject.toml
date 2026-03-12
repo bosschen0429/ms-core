@@ -53,4 +53,6 @@ line-length = 100
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+addopts = "-p no:cacheprovider"
 pythonpath = ["src"]
+norecursedirs = [".tmp", ".pytest_cache", "__pycache__"]

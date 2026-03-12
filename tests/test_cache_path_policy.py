@@ -3,16 +3,15 @@
 from __future__ import annotations
 
 from pathlib import Path
-from tempfile import TemporaryDirectory
 
 import pandas as pd
 
 
-def test_excel_cache_path_not_co_located_in_output_directory(monkeypatch) -> None:
+def test_excel_cache_path_not_co_located_in_output_directory(monkeypatch, project_temp_dir) -> None:
     from ms_core.utils.file_handler import FileHandler
 
-    with TemporaryDirectory(dir=Path.cwd()) as temp_dir:
-        base = Path(temp_dir)
+    with project_temp_dir() as temp_dir:
+        base = temp_dir
         cache_root = base / "internal-cache"
         monkeypatch.setenv("MSPTK_PARQUET_CACHE_ROOT", str(cache_root))
 
@@ -30,7 +29,7 @@ def test_excel_cache_path_not_co_located_in_output_directory(monkeypatch) -> Non
         assert cache_root in cache_path.parents
 
 
-def test_cache_failures_do_not_block_excel_save(monkeypatch) -> None:
+def test_cache_failures_do_not_block_excel_save(monkeypatch, project_temp_dir) -> None:
     from ms_core.utils import intermediate_store as store_module
     from ms_core.utils.file_handler import FileHandler
 
@@ -43,8 +42,8 @@ def test_cache_failures_do_not_block_excel_save(monkeypatch) -> None:
     monkeypatch.setattr(store_module.IntermediateStore, "save", _always_fail_store)
     monkeypatch.setattr(pd.DataFrame, "to_parquet", _always_fail_parquet)
 
-    with TemporaryDirectory(dir=Path.cwd()) as temp_dir:
-        excel_path = Path(temp_dir) / "result.xlsx"
+    with project_temp_dir() as temp_dir:
+        excel_path = temp_dir / "result.xlsx"
         df = pd.DataFrame({"Mz/RT": ["Sample_Type", "100.1/1.0"], "S1": ["case", 1234]})
         handler = FileHandler()
         saved = handler.save_data(df, excel_path, sheet_name="RawIntensity", save_parquet_cache=True)
