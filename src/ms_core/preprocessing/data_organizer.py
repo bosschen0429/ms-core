@@ -84,6 +84,62 @@ class DataOrganizer(BaseProcessor):
         super().__init__("Data Organizer")
         self.config = config or DataOrganizerConfig()
 
+    @staticmethod
+    def _is_pre_merged_mz_rt_header(col_name: str) -> bool:
+        """Return True when a column header indicates an already-combined Mz/RT column.
+
+        Accepts variants such as "Mz/RT", "mz/rt", "MZ/RT", "m/z/rt".
+        """
+        normalized = re.sub(r"[\s_]", "", col_name.lower())
+        return normalized in {"mz/rt", "m/z/rt", "mzrt"}
+
+    def _expand_pre_merged_mz_rt(
+        self, df: pd.DataFrame
+    ) -> Tuple[pd.DataFrame, bool]:
+        """Expand an already-combined Mz/RT column into separate numeric Mz and RT columns.
+
+        If the first column is a combined "Mz/RT" column (e.g., "274.0920/18.32"),
+        each value is parsed into a float Mz and a float RT, and two new columns
+        ("Mz" and "RT") replace the single combined column.  All remaining columns
+        are preserved as-is.
+
+        Returns:
+            Tuple of (resulting_df, was_expanded).  *was_expanded* is False when the
+            first column was not a pre-merged Mz/RT column or no values could be parsed.
+        """
+        if df.empty:
+            return df, False
+
+        first_col = str(df.columns[0]).strip().lower()
+        if not self._is_pre_merged_mz_rt_header(first_col):
+            return df, False
+
+        mz_values: list = []
+        rt_values: list = []
+        any_parsed = False
+
+        for val in df.iloc[:, 0]:
+            val_str = str(val).strip()
+            parts = val_str.split("/")
+            if len(parts) == 2:
+                try:
+                    mz_values.append(float(parts[0].strip()))
+                    rt_values.append(float(parts[1].strip()))
+                    any_parsed = True
+                    continue
+                except ValueError:
+                    pass
+            # Non-parseable row (e.g., NaN placeholder) — keep as-is
+            mz_values.append(np.nan)
+            rt_values.append(np.nan)
+
+        if not any_parsed:
+            return df, False
+
+        rest_df = df.iloc[:, 1:].reset_index(drop=True)
+        expanded = pd.DataFrame({"Mz": mz_values, "RT": rt_values})
+        return pd.concat([expanded, rest_df], axis=1), True
+
     def _is_non_sample_column(self, column_name: str) -> bool:
         """Return True when a column is metadata and should not be treated as a sample."""
         name = str(column_name).strip().lower()
@@ -264,11 +320,20 @@ class DataOrganizer(BaseProcessor):
         if df is None or df.empty:
             return False, "Input data is empty"
 
+        if len(df.columns) < 2:
+            return False, "Input data must have at least 2 columns"
+
+        first_col = str(df.columns[0]).lower().strip()
+
+        # Pre-merged Mz/RT: first column is already "Mz/RT" (combined).
+        # Only one sample column is required in addition to the Mz/RT column.
+        if self._is_pre_merged_mz_rt_header(first_col):
+            return True, ""
+
+        # Standard MZmine export: separate Mz and RT columns required.
         if len(df.columns) < 3:
             return False, "Input data must have at least 3 columns (Mz, RT, and at least one sample)"
 
-        # Check if first two columns look like Mz and RT
-        first_col = str(df.columns[0]).lower()
         second_col = str(df.columns[1]).lower()
 
         if "mz" not in first_col and "m/z" not in first_col and "mass" not in first_col:
@@ -342,6 +407,10 @@ class DataOrganizer(BaseProcessor):
             }
             result_df, input_sample_types, input_type_stats = self._extract_sample_type_row_from_input(result_df)
             stats.update(input_type_stats)
+
+            # Expand pre-merged Mz/RT column into separate numeric Mz and RT columns
+            # so that _merge_mz_rt can re-format them to the standard precision.
+            result_df, _was_expanded = self._expand_pre_merged_mz_rt(result_df)
 
             # Step 1: Parse method file if provided
             self.update_progress(10, "Parsing method file...")
@@ -480,8 +549,13 @@ class DataOrganizer(BaseProcessor):
             }
             result_df, input_sample_types, input_type_stats = self._extract_sample_type_row_from_input(result_df)
             stats.update(input_type_stats)
-            original_mz_col = str(df.columns[0])
-            original_rt_col = str(df.columns[1])
+
+            # Expand pre-merged Mz/RT column into separate numeric Mz and RT columns
+            # before capturing original values for later restoration in statistics output.
+            result_df, _was_expanded = self._expand_pre_merged_mz_rt(result_df)
+
+            original_mz_col = str(result_df.columns[0])
+            original_rt_col = str(result_df.columns[1])
             original_mz_values = result_df.iloc[:, 0].tolist()
             original_rt_values = result_df.iloc[:, 1].tolist()
 
