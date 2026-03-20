@@ -62,8 +62,8 @@ class PipelineConfig:
 
     # Step 3: MS quality filter (ratio-based)
     quality_bg_threshold: float = 0.33
-    quality_skew_threshold: float = 0.66
     quality_diff_threshold: float = 0.30
+    quality_intensity_fc_threshold: float = 2.0
 
     # Step 4: Missing values
     missing_threshold: float = 0.5
@@ -163,7 +163,7 @@ def _step_ms_quality_filter(ds: MSDataset, **params: Any) -> MSDataset:
 
     processor = FeatureFilter()
     kw = {}
-    for key in ("background_threshold", "skew_threshold", "diff_threshold"):
+    for key in ("background_threshold", "diff_threshold", "intensity_fc_threshold"):
         if key in params:
             kw[key] = params[key]
     result = processor.process(ds.matrix, **kw)
@@ -468,8 +468,8 @@ class MSPipeline:
             },
             3: {
                 "background_threshold": cfg.quality_bg_threshold,
-                "skew_threshold": cfg.quality_skew_threshold,
                 "diff_threshold": cfg.quality_diff_threshold,
+                "intensity_fc_threshold": cfg.quality_intensity_fc_threshold,
             },
             4: {
                 "missing_threshold": cfg.missing_threshold,
