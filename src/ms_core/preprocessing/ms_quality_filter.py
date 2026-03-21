@@ -177,11 +177,23 @@ class FeatureFilter(BaseProcessor):
                 return ProcessingResult(success=False, message="Processing cancelled")
 
             # Step 4: Impute missing values
+            # Reuse numeric block from _calculate_ratios, sliced to kept rows
             self.update_progress(75, "Imputing missing values...")
+            keep_mask = filter_stats.get("_keep_mask")
+            if keep_mask is not None and numeric_block["values"].shape[0] > 0:
+                filtered_block = numeric_block["values"][keep_mask].copy()
+                reused_block = {
+                    "values": filtered_block,
+                    "all_cols": numeric_block["all_cols"],
+                    "col_pos": numeric_block["col_pos"],
+                }
+            else:
+                reused_block = None
             result_df, impute_stats = self._impute_missing_values(
                 result_df,
                 group_info,
                 ratio_cols,
+                precomputed_block=reused_block,
             )
 
             self.update_progress(100, "Feature filtering complete")
@@ -505,6 +517,9 @@ class FeatureFilter(BaseProcessor):
         stats["qc_zero_deleted"] = int((qc_zero & non_protected).sum())
         stats["qc_low_deleted"] = int((qc_low & non_protected).sum())
 
+        # Expose keep_mask for numeric block reuse in _impute_missing_values
+        stats["_keep_mask"] = keep_mask
+
         # Build keep rows
         for i, keep in enumerate(keep_mask, start=1):
             if keep:
@@ -536,6 +551,7 @@ class FeatureFilter(BaseProcessor):
         df: pd.DataFrame,
         group_info: Dict[str, Any],
         ratio_cols: Dict[str, str],
+        precomputed_block: Dict[str, Any] | None = None,
     ) -> Tuple[pd.DataFrame, Dict[str, Any]]:
         """
         Impute missing values using group-specific minimum/2.
@@ -578,18 +594,23 @@ class FeatureFilter(BaseProcessor):
             for group_name in group_info["groups"].keys():
                 special_case[group_name] = np.zeros(len(df) - 1, dtype=bool)
 
-        # Build numeric block once for all group/QC columns
-        all_cols_set = set()
-        for cols in group_info["groups"].values():
-            all_cols_set.update(cols)
-        all_cols_set.update(group_info.get("qc_cols", []))
-        all_cols = sorted(all_cols_set)
-        col_pos = {col_idx: pos for pos, col_idx in enumerate(all_cols)}
-        if all_cols:
-            block_all = df.iloc[1:, all_cols].apply(pd.to_numeric, errors="coerce")
-            block_values = block_all.to_numpy(copy=True)
+        # Reuse precomputed numeric block or build from scratch
+        if precomputed_block is not None:
+            all_cols = precomputed_block["all_cols"]
+            col_pos = precomputed_block["col_pos"]
+            block_values = precomputed_block["values"]
         else:
-            block_values = np.zeros((len(df) - 1, 0))
+            all_cols_set = set()
+            for cols in group_info["groups"].values():
+                all_cols_set.update(cols)
+            all_cols_set.update(group_info.get("qc_cols", []))
+            all_cols = sorted(all_cols_set)
+            col_pos = {col_idx: pos for pos, col_idx in enumerate(all_cols)}
+            if all_cols:
+                block_all = df.iloc[1:, all_cols].apply(pd.to_numeric, errors="coerce")
+                block_values = block_all.to_numpy(copy=True)
+            else:
+                block_values = np.zeros((len(df) - 1, 0))
 
         # Impute group columns in blocks
         for group_name, col_indices in group_info["groups"].items():
