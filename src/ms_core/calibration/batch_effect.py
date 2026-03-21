@@ -2823,5 +2823,62 @@ def main(input_file=None):
         raise
 
 
+def process_in_memory(data_df, sample_info_df, **kwargs):
+    """Pipeline-friendly entry point — bypass file I/O.
+
+    Parameters
+    ----------
+    data_df : DataFrame
+        Features-as-rows with feature-ID first column + sample columns.
+    sample_info_df : DataFrame
+        Must contain ``Sample_Name`` and ``Batch`` columns.
+
+    Returns
+    -------
+    DataFrame or None
+        ComBat-corrected result with feature-ID + sample columns, or the
+        original *data_df* unchanged when there is only a single batch.
+    """
+    if data_df is None or data_df.empty:
+        return None
+    if sample_info_df is None or sample_info_df.empty:
+        return None
+
+    # Early single-batch check (prepare_data_for_combat raises on < 2 batches)
+    if "Batch" in sample_info_df.columns:
+        unique_batches = sample_info_df["Batch"].dropna().unique()
+        if len(unique_batches) < 2:
+            return data_df
+
+    # prepare_data_for_combat expects the raw data_df (feature-col + samples)
+    try:
+        data_matrix, batch_info, sample_columns, feature_ids = prepare_data_for_combat(
+            data_df, sample_info_df
+        )
+    except ValueError:
+        # Missing Batch column, insufficient batches, etc.
+        return data_df
+
+    unique_batches = list(set(batch_info))
+    if len(unique_batches) < 2:
+        # Single batch → nothing to correct; return data as-is
+        return data_df
+
+    # Check batch ↔ sample-type confounding
+    confound = check_batch_confounding(sample_info_df)
+    if confound.get("is_confounded", False):
+        # Confounded → correction would remove biological signal; return as-is
+        return data_df
+
+    # Core ComBat correction
+    corrected_data = perform_combat_correction(data_matrix, batch_info)
+
+    # Reconstruct DataFrame
+    feature_col = data_df.columns[0]
+    result_df = pd.DataFrame(corrected_data, columns=sample_columns)
+    result_df.insert(0, feature_col, feature_ids)
+    return result_df
+
+
 if __name__ == "__main__":
     main()

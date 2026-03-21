@@ -2619,6 +2619,46 @@ def main(input_file=None):
     )
 
 
+def process_in_memory(data_df, sample_info_df, **kwargs):
+    """Pipeline-friendly entry point — bypass file I/O.
+
+    Parameters
+    ----------
+    data_df : DataFrame
+        Features-as-rows with feature-ID first column + sample columns.
+    sample_info_df : DataFrame
+        Must contain ``Sample_Name``, ``Sample_Type``, and a numeric
+        correction column (e.g. creatinine concentration).
+
+    Returns
+    -------
+    DataFrame or None
+        PQN-normalized result with feature-ID + sample columns, or *None*
+        if no correction column is found or normalization fails.
+    """
+    if data_df is None or data_df.empty:
+        return None
+    if sample_info_df is None or sample_info_df.empty:
+        return None
+
+    correction_col, _correction_type = find_correction_column(sample_info_df)
+    if correction_col is None:
+        return None
+
+    # perform_normalization accepts file_path but doesn't use it internally
+    result = perform_normalization(data_df, sample_info_df, correction_col, file_path=None)
+    if result is None:
+        return None
+
+    normalized_df = result[0]
+
+    # Strip CV% statistics columns — keep only feature-ID + sample columns
+    feature_col = normalized_df.columns[0]
+    sample_columns = get_all_sample_columns(data_df, sample_info_df)
+    keep_cols = [feature_col] + [c for c in sample_columns if c in normalized_df.columns]
+    return normalized_df[keep_cols]
+
+
 if __name__ == "__main__":
     # 🔧 獨立運行時不傳入 input_file，會顯示對話框
     main()
