@@ -7,7 +7,7 @@ Pipeline order (NEVER reorder):
     4.  Missing value imputation  (processing)     — 8 methods
     5.  ISTD marking + correction (preprocessing + calibration)
     6.  QC-LOWESS trend correction(calibration)
-    7.  Batch effect ComBat       (calibration)
+    7.  Batch effect correction   (calibration)
     8.  Feature filtering IQR/RSD (processing)     — overall variance
     9.  PQN normalization         (calibration)     — smart QC assessment
     10. Generalized log transform (processing)     — glog, NOT log2(x+1)
@@ -115,7 +115,7 @@ STEPS: dict[int, StepDef] = {
     4: StepDef(4, "missing_value", "Missing Value Imputation", "processing"),
     5: StepDef(5, "istd_correction", "ISTD Marking + Correction", "calibration"),
     6: StepDef(6, "qc_lowess", "QC-LOWESS Trend Correction", "calibration"),
-    7: StepDef(7, "batch_effect", "Batch Effect ComBat", "calibration"),
+    7: StepDef(7, "batch_effect", "Batch Effect Correction", "calibration"),
     8: StepDef(8, "feature_filter", "Feature Filtering (IQR/RSD)", "processing"),
     9: StepDef(9, "pqn_normalize", "PQN Normalization", "calibration"),
     10: StepDef(10, "transform", "Generalized Log Transform", "processing"),
@@ -231,7 +231,7 @@ def _step_qc_lowess(ds: MSDataset, **params: Any) -> MSDataset:
 
 
 def _step_batch_effect(ds: MSDataset, **params: Any) -> MSDataset:
-    """Step 7: ComBat batch effect correction via tempfile round-trip."""
+    """Step 7: Batch effect correction."""
     return _calibration_wrapper(
         step_num=7,
         calibration_module="ms_core.calibration.batch_effect",
