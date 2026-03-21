@@ -10,6 +10,7 @@ This module handles feature filtering and missing value imputation:
 Based on: Feature_barrier_V3.bas
 """
 
+import warnings
 from typing import Optional, Dict, Any, List, Set, Tuple
 import pandas as pd
 import numpy as np
@@ -28,8 +29,8 @@ class FeatureFilter(BaseProcessor):
     2. Calculates signal ratio for each group
     3. Filters features based on multiple criteria:
        - Stable: >=2 groups with ratio >= background threshold
-       - Skewed: Any group with ratio >= skew threshold
        - Different: Any two groups with ratio difference >= diff threshold
+       - Intensity: Any two groups with mean intensity fold-change >= threshold
     4. Removes features with QC_ratio = 0 or below threshold
     5. Imputes missing values using group-specific minimum/2
     """
@@ -69,13 +70,13 @@ class FeatureFilter(BaseProcessor):
         self,
         df: pd.DataFrame,
         background_threshold: Optional[float] = None,
-        skew_threshold: Optional[float] = None,
         diff_threshold: Optional[float] = None,
         qc_ratio_threshold: Optional[float] = None,
+        intensity_fc_threshold: Optional[float] = None,
         enable_background_threshold: bool = True,
-        enable_skew_threshold: bool = True,
         enable_diff_threshold: bool = True,
         enable_qc_ratio_threshold: bool = True,
+        enable_intensity_fc_threshold: bool = True,
         protected_rows: Optional[Set[int]] = None,
         **kwargs,
     ) -> ProcessingResult:
@@ -85,13 +86,13 @@ class FeatureFilter(BaseProcessor):
         Args:
             df: Input DataFrame
             background_threshold: Threshold for stable features (0-1)
-            skew_threshold: Threshold for skewed features (0-1)
             diff_threshold: Threshold for differential features (0-1)
             qc_ratio_threshold: Minimum QC_ratio to keep a feature (0-1)
+            intensity_fc_threshold: Minimum fold-change of group mean intensities (>=1)
             enable_background_threshold: Whether to apply stable feature rule
-            enable_skew_threshold: Whether to apply skewed feature rule
             enable_diff_threshold: Whether to apply differential feature rule
             enable_qc_ratio_threshold: Whether to apply QC-based deletion rules
+            enable_intensity_fc_threshold: Whether to apply intensity fold-change rule
             protected_rows: Set of row indices (red font) to protect from removal
             **kwargs: Additional parameters
 
@@ -100,14 +101,28 @@ class FeatureFilter(BaseProcessor):
         """
         self.reset()
 
+        # Deprecation guard for removed parameters
+        _REMOVED = {"skew_threshold", "enable_skew_threshold"}
+        for removed_key in _REMOVED & kwargs.keys():
+            warnings.warn(
+                f"Parameter '{removed_key}' was removed in the gate logic refactor. "
+                "It will be silently ignored. Use intensity_fc_threshold instead.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+
         # Use config defaults if not specified
         bg_thresh = background_threshold if background_threshold is not None else self.config.default_background_threshold
-        skew_thresh = skew_threshold if skew_threshold is not None else self.config.default_skew_threshold
         diff_thresh = diff_threshold if diff_threshold is not None else self.config.default_diff_threshold
         qc_ratio_thresh = (
             qc_ratio_threshold
             if qc_ratio_threshold is not None
             else self.config.default_qc_ratio_threshold
+        )
+        intensity_fc_thresh = (
+            intensity_fc_threshold
+            if intensity_fc_threshold is not None
+            else self.config.default_intensity_fc_threshold
         )
 
         # Validate input
@@ -135,7 +150,7 @@ class FeatureFilter(BaseProcessor):
 
             # Step 2: Calculate ratios for each group
             self.update_progress(25, "Calculating group ratios...")
-            result_df, ratio_cols = self._calculate_ratios(result_df, group_info)
+            result_df, ratio_cols, numeric_block = self._calculate_ratios(result_df, group_info)
 
             if self._cancelled:
                 return ProcessingResult(success=False, message="Processing cancelled")
@@ -147,14 +162,15 @@ class FeatureFilter(BaseProcessor):
                 group_info,
                 ratio_cols,
                 bg_thresh,
-                skew_thresh,
                 diff_thresh,
                 qc_ratio_thresh,
+                intensity_fc_thresh,
                 enable_background_threshold,
-                enable_skew_threshold,
                 enable_diff_threshold,
                 enable_qc_ratio_threshold,
+                enable_intensity_fc_threshold,
                 protected_rows or set(),
+                numeric_block,
             )
 
             if self._cancelled:
@@ -196,15 +212,15 @@ class FeatureFilter(BaseProcessor):
                     "ratio_columns": ratio_cols,
                     "thresholds": {
                         "background": bg_thresh,
-                        "skew": skew_thresh,
                         "diff": diff_thresh,
                         "qc_ratio": qc_ratio_thresh,
+                        "intensity_fc": intensity_fc_thresh,
                     },
                     "enabled_thresholds": {
                         "background": bool(enable_background_threshold),
-                        "skew": bool(enable_skew_threshold),
                         "diff": bool(enable_diff_threshold),
                         "qc_ratio": bool(enable_qc_ratio_threshold),
+                        "intensity_fc": bool(enable_intensity_fc_threshold),
                     },
                     "deleted_features": deleted_features,
                     "blue_font_cells": impute_stats.get("imputed_cells", []),
@@ -272,11 +288,15 @@ class FeatureFilter(BaseProcessor):
         self,
         df: pd.DataFrame,
         group_info: Dict[str, Any],
-    ) -> Tuple[pd.DataFrame, Dict[str, str]]:
+    ) -> Tuple[pd.DataFrame, Dict[str, str], Dict[str, Any]]:
         """
         Calculate signal ratio for each group.
 
-        Returns DataFrame with ratio columns and dict mapping group to ratio column name.
+        Returns:
+            - DataFrame with ratio columns appended
+            - dict mapping group name to ratio column name
+            - numeric_block dict with 'values' (numpy array), 'all_cols' (sorted col indices),
+              'col_pos' (col_idx -> position mapping) for reuse in _filter_features
         """
         ratio_cols = {}
         signal_threshold = self.config.signal_threshold
@@ -326,7 +346,13 @@ class FeatureFilter(BaseProcessor):
             else:
                 df[qc_ratio_col] = ["na"] + [0] * (len(df) - 1)
 
-        return df, ratio_cols
+        numeric_block = {
+            "values": block_all_values,
+            "all_cols": all_cols,
+            "col_pos": col_pos,
+        }
+
+        return df, ratio_cols, numeric_block
 
     def _filter_features(
         self,
@@ -334,29 +360,33 @@ class FeatureFilter(BaseProcessor):
         group_info: Dict[str, Any],
         ratio_cols: Dict[str, str],
         bg_threshold: float,
-        skew_threshold: float,
         diff_threshold: float,
         qc_ratio_threshold: float,
+        intensity_fc_threshold: float,
         enable_background_threshold: bool,
-        enable_skew_threshold: bool,
         enable_diff_threshold: bool,
         enable_qc_ratio_threshold: bool,
+        enable_intensity_fc_threshold: bool,
         protected_rows: Set[int],
+        numeric_block: Dict[str, Any],
     ) -> Tuple[pd.DataFrame, List[pd.Series], Dict[str, Any]]:
         """
-        Filter features based on ratio criteria.
+        Filter features based on ratio and intensity criteria.
 
         Returns filtered DataFrame, deleted rows, and statistics.
         """
         stats = {
             "kept_count": 0,
             "deleted_count": 0,
-            "skew_kept": 0,
             "stable_kept": 0,
             "diff_kept": 0,
+            "intensity_fc_kept": 0,
             "qc_zero_deleted": 0,
             "qc_low_deleted": 0,
             "protected_kept": 0,
+            "unique_stable_kept": 0,
+            "unique_diff_kept": 0,
+            "unique_intensity_fc_kept": 0,
         }
 
         deleted_features = []
@@ -400,53 +430,80 @@ class FeatureFilter(BaseProcessor):
             qc_zero = np.zeros(len(df) - 1, dtype=bool)
             qc_low = np.zeros(len(df) - 1, dtype=bool)
 
-        # Conditions
+        n_features = len(df) - 1
+
+        # --- Ratio-based gates ---
         if ratio_matrix.shape[1] > 0:
-            skew_keep = (
-                (ratio_matrix >= skew_threshold).any(axis=1)
-                if enable_skew_threshold
-                else np.zeros(len(df) - 1, dtype=bool)
-            )
             # Max diff across groups
             max_diff = ratio_matrix.max(axis=1) - ratio_matrix.min(axis=1)
             diff_keep = (
                 max_diff >= diff_threshold
                 if enable_diff_threshold and ratio_matrix.shape[1] >= 2
-                else np.zeros(len(df) - 1, dtype=bool)
+                else np.zeros(n_features, dtype=bool)
             )
             stable_keep = (
                 (ratio_matrix >= bg_threshold).sum(axis=1) >= 2
                 if enable_background_threshold
-                else np.zeros(len(df) - 1, dtype=bool)
+                else np.zeros(n_features, dtype=bool)
             )
         else:
-            skew_keep = np.zeros(len(df) - 1, dtype=bool)
-            diff_keep = np.zeros(len(df) - 1, dtype=bool)
-            stable_keep = np.zeros(len(df) - 1, dtype=bool)
+            diff_keep = np.zeros(n_features, dtype=bool)
+            stable_keep = np.zeros(n_features, dtype=bool)
 
+        # --- Intensity fold-change gate ---
+        if enable_intensity_fc_threshold and ratio_matrix.shape[1] >= 2:
+            block_values = numeric_block["values"]
+            col_pos = numeric_block["col_pos"]
+            intensity_means = []
+            for group_name in group_names:
+                col_indices = group_info["groups"][group_name]
+                pos = [col_pos[c] for c in col_indices]
+                group_block = block_values[:, pos]
+                intensity_means.append(np.nanmean(group_block, axis=1))
+            intensity_matrix = np.column_stack(intensity_means)
+
+            safe_matrix = np.where(intensity_matrix > 0, intensity_matrix, np.nan)
+            max_mean = np.nanmax(safe_matrix, axis=1)
+            min_mean = np.nanmin(safe_matrix, axis=1)
+            with np.errstate(divide="ignore", invalid="ignore"):
+                fold_change = np.where(min_mean > 0, max_mean / min_mean, np.inf)
+            # All-NaN rows (no signal in any group) → fail
+            fold_change = np.where(np.isnan(fold_change), 0.0, fold_change)
+            intensity_fc_keep = fold_change >= intensity_fc_threshold
+        else:
+            intensity_fc_keep = np.zeros(n_features, dtype=bool)
+
+        # --- Combine positive rules (OR) ---
         positive_rules = []
-        if enable_skew_threshold:
-            positive_rules.append(skew_keep)
-        if enable_diff_threshold:
-            positive_rules.append(diff_keep)
         if enable_background_threshold:
             positive_rules.append(stable_keep)
+        if enable_diff_threshold:
+            positive_rules.append(diff_keep)
+        if enable_intensity_fc_threshold:
+            positive_rules.append(intensity_fc_keep)
 
         if positive_rules:
             keep_mask = protected_mask | np.logical_or.reduce(positive_rules)
         else:
-            keep_mask = np.ones(len(df) - 1, dtype=bool)
+            keep_mask = np.ones(n_features, dtype=bool)
 
         # If QC ratio fails gate and not protected, force delete
         keep_mask = np.where((qc_zero | qc_low) & ~protected_mask, False, keep_mask)
 
         # Update stats
+        non_protected = ~protected_mask
+        not_qc_killed = ~(qc_zero | qc_low)
+        effective = non_protected & not_qc_killed
+
         stats["protected_kept"] = int(protected_mask.sum())
-        stats["skew_kept"] = int((skew_keep & ~protected_mask).sum())
-        stats["diff_kept"] = int((diff_keep & ~protected_mask).sum())
-        stats["stable_kept"] = int((stable_keep & ~protected_mask).sum())
-        stats["qc_zero_deleted"] = int((qc_zero & ~protected_mask).sum())
-        stats["qc_low_deleted"] = int((qc_low & ~protected_mask).sum())
+        stats["stable_kept"] = int((stable_keep & non_protected).sum())
+        stats["diff_kept"] = int((diff_keep & non_protected).sum())
+        stats["intensity_fc_kept"] = int((intensity_fc_keep & non_protected).sum())
+        stats["unique_stable_kept"] = int((stable_keep & ~diff_keep & ~intensity_fc_keep & effective).sum())
+        stats["unique_diff_kept"] = int((diff_keep & ~stable_keep & ~intensity_fc_keep & effective).sum())
+        stats["unique_intensity_fc_kept"] = int((intensity_fc_keep & ~stable_keep & ~diff_keep & effective).sum())
+        stats["qc_zero_deleted"] = int((qc_zero & non_protected).sum())
+        stats["qc_low_deleted"] = int((qc_low & non_protected).sum())
 
         # Build keep rows
         for i, keep in enumerate(keep_mask, start=1):
