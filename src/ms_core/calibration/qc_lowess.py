@@ -2102,5 +2102,72 @@ def main(input_file=None):
     )
 
 
+def process_in_memory(data_df, sample_info_df, **kwargs):
+    """Pipeline-friendly entry point — bypass file I/O.
+
+    Parameters
+    ----------
+    data_df : DataFrame
+        Features-as-rows with ``FeatureID`` (or first column) + sample columns.
+    sample_info_df : DataFrame
+        Must contain ``Sample_Name``, ``Sample_Type``, ``Injection_Order``.
+        ``Batch`` is optional (defaults to ``'Batch1'``).
+
+    Returns
+    -------
+    DataFrame or None
+        LOWESS-corrected result with ``FeatureID`` + sample columns.
+    """
+    if data_df is None or data_df.empty:
+        return None
+    if sample_info_df is None or sample_info_df.empty:
+        return None
+
+    df = data_df.copy()
+
+    # Ensure FeatureID column name
+    if FEATURE_ID_COLUMN in df.columns and FEATURE_ID_COLUMN != "FeatureID":
+        df.rename(columns={FEATURE_ID_COLUMN: "FeatureID"}, inplace=True)
+    elif "FeatureID" not in df.columns:
+        df.rename(columns={df.columns[0]: "FeatureID"}, inplace=True)
+
+    # Ensure Batch column exists
+    if "Batch" not in sample_info_df.columns:
+        sample_info_df = sample_info_df.copy()
+        sample_info_df["Batch"] = "Batch1"
+
+    # Ensure Injection_Order is numeric
+    if "Injection_Order" in sample_info_df.columns:
+        sample_info_df = sample_info_df.copy()
+        sample_info_df["Injection_Order"] = pd.to_numeric(
+            sample_info_df["Injection_Order"], errors="coerce"
+        )
+        # Fill missing with sequential values
+        mask = sample_info_df["Injection_Order"].isna()
+        if mask.any():
+            sample_info_df.loc[mask, "Injection_Order"] = range(1, mask.sum() + 1)
+
+    # Identify sample columns
+    sample_cols, _ = identify_sample_columns(df, sample_info_df)
+    sample_cols = [c for c in sample_cols if c in df.columns]
+    if not sample_cols:
+        return None
+
+    # Convert to numeric, fill NaN with 0
+    df[sample_cols] = df[sample_cols].apply(pd.to_numeric, errors="coerce").fillna(0)
+
+    # Attach sample_columns via attrs (expected by perform_lowess_normalization)
+    df.attrs["sample_columns"] = sample_cols
+
+    # Core processing
+    result = perform_lowess_normalization(df, sample_info_df)
+    lowess_df = result[0]
+    result_sample_cols = result[1]
+
+    # Return only FeatureID + sample columns
+    keep_cols = ["FeatureID"] + [c for c in result_sample_cols if c in lowess_df.columns]
+    return lowess_df[keep_cols]
+
+
 if __name__ == "__main__":
     main()

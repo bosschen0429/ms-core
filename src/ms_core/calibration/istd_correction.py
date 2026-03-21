@@ -1783,6 +1783,74 @@ def main(input_file=None):
     )
 
 
+def process_in_memory(data_df, sample_info_df, **kwargs):
+    """Pipeline-friendly entry point — bypass file I/O.
+
+    Parameters
+    ----------
+    data_df : DataFrame
+        Features-as-rows with ``FeatureID`` first column and sample columns.
+    sample_info_df : DataFrame
+        Must contain ``Sample_Name`` and ``Sample_Type`` columns.
+    **kwargs
+        istd_feature_ids : list[str], optional
+            Explicit list of FeatureID values that are ISTDs.
+            If not provided and ``is_ISTD`` column is absent, returns *None*
+            so the wrapper falls back to the temp-file path (which can read
+            red-font ISTD markers from Excel).
+
+    Returns
+    -------
+    DataFrame or None
+        Result with ``FeatureID`` + sample columns, or None if ISTD info
+        is unavailable.
+    """
+    if data_df is None or data_df.empty:
+        return None
+
+    df = data_df.copy()
+
+    # Ensure first column is named FeatureID
+    if df.columns[0] != "FeatureID":
+        df.rename(columns={df.columns[0]: "FeatureID"}, inplace=True)
+
+    # --- Parse mz / rt from FeatureID (format "mz/rt") ---
+    if "mz" not in df.columns or "rt" not in df.columns:
+        def _parse_fid(fid):
+            if isinstance(fid, str) and "/" in fid:
+                parts = fid.split("/")
+                if len(parts) >= 2:
+                    return parts[0], parts[1]
+            return np.nan, np.nan
+
+        parsed = df["FeatureID"].apply(_parse_fid)
+        df["mz"] = pd.to_numeric([p[0] for p in parsed], errors="coerce")
+        df["rt"] = pd.to_numeric([p[1] for p in parsed], errors="coerce")
+
+    # --- Determine is_ISTD ---
+    istd_ids = kwargs.get("istd_feature_ids")
+    if istd_ids is not None:
+        df["is_ISTD"] = df["FeatureID"].astype(str).str.strip().isin(istd_ids)
+    elif "is_ISTD" not in df.columns:
+        # Cannot identify ISTDs without file-level font info → fallback
+        return None
+
+    # Convert sample columns to numeric, fill NaN with 0
+    from ms_core.utils.constants import NON_SAMPLE_COLUMNS
+
+    non_sample = NON_SAMPLE_COLUMNS | {"is_ISTD", "Sample_Type", "sample_type", "mz", "rt"}
+    sample_columns = [c for c in df.columns if c not in non_sample and c != "FeatureID"]
+    df[sample_columns] = df[sample_columns].apply(pd.to_numeric, errors="coerce").fillna(0)
+    df[sample_columns] = df[sample_columns].clip(lower=0)
+
+    # --- Core processing ---
+    results_df, result_sample_cols = calculate_corrected_ratios(df, sample_info_df)
+
+    # Return only FeatureID + sample columns (drop ISTD metadata columns)
+    keep_cols = ["FeatureID"] + [c for c in result_sample_cols if c in results_df.columns]
+    return results_df[keep_cols]
+
+
 if __name__ == "__main__":
     # 🔧 獨立運行時不傳入 input_file，會顯示對話框
     main()

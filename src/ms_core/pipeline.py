@@ -7,7 +7,7 @@ Pipeline order (NEVER reorder):
     4.  Missing value imputation  (processing)     — 8 methods
     5.  ISTD marking + correction (preprocessing + calibration)
     6.  QC-LOWESS trend correction(calibration)
-    7.  Batch effect ComBat       (calibration)
+    7.  Batch effect correction   (calibration)
     8.  Feature filtering IQR/RSD (processing)     — overall variance
     9.  PQN normalization         (calibration)     — smart QC assessment
     10. Generalized log transform (processing)     — glog, NOT log2(x+1)
@@ -115,7 +115,7 @@ STEPS: dict[int, StepDef] = {
     4: StepDef(4, "missing_value", "Missing Value Imputation", "processing"),
     5: StepDef(5, "istd_correction", "ISTD Marking + Correction", "calibration"),
     6: StepDef(6, "qc_lowess", "QC-LOWESS Trend Correction", "calibration"),
-    7: StepDef(7, "batch_effect", "Batch Effect ComBat", "calibration"),
+    7: StepDef(7, "batch_effect", "Batch Effect Correction", "calibration"),
     8: StepDef(8, "feature_filter", "Feature Filtering (IQR/RSD)", "processing"),
     9: StepDef(9, "pqn_normalize", "PQN Normalization", "calibration"),
     10: StepDef(10, "transform", "Generalized Log Transform", "processing"),
@@ -197,7 +197,21 @@ def _step_missing_value(ds: MSDataset, **params: Any) -> MSDataset:
 
 
 def _step_istd_correction(ds: MSDataset, **params: Any) -> MSDataset:
-    """Step 5: ISTD marking + correction via tempfile round-trip."""
+    """Step 5: ISTD marking + correction.
+
+    ISTD feature IDs are resolved from (in priority order):
+    1. ``istd_feature_ids`` in *params*  (explicit override)
+    2. ``is_istd`` column in ``ds.feature_info``  (set by upstream ISTDMarker)
+    3. Red-font detection in Excel  (legacy temp-file fallback)
+    """
+    if "istd_feature_ids" not in params:
+        # Try to extract from feature_info (populated by ISTDMarker / Step 2)
+        fi = ds.feature_info
+        if not fi.empty and "is_istd" in fi.columns:
+            istd_ids = fi.index[fi["is_istd"].astype(bool)].tolist()
+            if istd_ids:
+                params = {**params, "istd_feature_ids": istd_ids}
+
     return _calibration_wrapper(
         step_num=5,
         calibration_module="ms_core.calibration.istd_correction",
@@ -217,7 +231,7 @@ def _step_qc_lowess(ds: MSDataset, **params: Any) -> MSDataset:
 
 
 def _step_batch_effect(ds: MSDataset, **params: Any) -> MSDataset:
-    """Step 7: ComBat batch effect correction via tempfile round-trip."""
+    """Step 7: Batch effect correction."""
     return _calibration_wrapper(
         step_num=7,
         calibration_module="ms_core.calibration.batch_effect",
@@ -294,7 +308,51 @@ _EXECUTORS: dict[int, Callable[..., MSDataset]] = {
 
 
 # ======================================================================
-# Calibration tempfile wrapper
+# Calibration helpers — in-memory data conversion
+# ======================================================================
+
+
+def _dataset_to_calibration_df(ds: MSDataset) -> pd.DataFrame:
+    """Transpose MSDataset (samples×features) → calibration format (features×samples).
+
+    Calibration modules expect rows=features, columns=samples, with a leading
+    ``FeatureID`` column.  MSDataset stores the transpose of that.
+    """
+    transposed = ds.matrix.T  # index=feature_ids, columns=sample_ids
+    df = transposed.reset_index()
+    df.rename(columns={df.columns[0]: "FeatureID"}, inplace=True)
+    return df
+
+
+def _calibration_df_to_dataset(
+    result_df: pd.DataFrame,
+    original_ds: MSDataset,
+    step_num: int,
+) -> MSDataset:
+    """Convert calibration result (features×samples) → MSDataset.
+
+    Only sample columns present in the original dataset are kept; extra
+    statistical columns produced by calibration modules are dropped.
+    """
+    feature_col = result_df.columns[0]
+    sample_names = list(original_ds.matrix.index)
+    available = [s for s in sample_names if s in result_df.columns]
+
+    matrix = result_df.set_index(feature_col)[available].T
+    matrix.columns.name = None  # clear index name artifact from set_index
+    matrix = matrix.apply(pd.to_numeric, errors="coerce")
+
+    return MSDataset(
+        matrix=matrix,
+        labels=original_ds.labels.reindex(matrix.index),
+        sample_info=original_ds.sample_info,
+        feature_info=original_ds.feature_info,
+        processing_log=list(original_ds.processing_log),
+    )
+
+
+# ======================================================================
+# Calibration wrapper (in-memory preferred, temp-file fallback)
 # ======================================================================
 
 
@@ -350,12 +408,31 @@ def _calibration_wrapper(
     ds: MSDataset,
     **params: Any,
 ) -> MSDataset:
-    """Generic wrapper: MSDataset → temp Excel → calibration main() → MSDataset."""
+    """Run a calibration module, preferring the in-memory path.
+
+    If the module exposes ``process_in_memory(data_df, sample_info_df, **kw)``
+    the wrapper converts MSDataset ↔ calibration DataFrame directly, avoiding
+    all Excel serialization (≈10× faster).  Otherwise it falls back to the
+    legacy temp-file round-trip.
+    """
     import importlib
 
     mod = importlib.import_module(calibration_module)
     step_label = STEPS[step_num].label
 
+    # ── fast path: in-memory ──────────────────────────────────────────
+    if hasattr(mod, "process_in_memory"):
+        data_df = _dataset_to_calibration_df(ds)
+        logger.info("Running %s (in-memory) ...", step_label)
+        result_df = mod.process_in_memory(data_df, ds.sample_info.copy(), **params)
+        if result_df is not None:
+            new_ds = _calibration_df_to_dataset(result_df, ds, step_num)
+            new_ds.log(f"[Step {step_num}] {step_label}: completed")
+            return new_ds
+        # None → module cannot run in-memory (e.g., missing ISTD info)
+        logger.info("%s: in-memory unavailable, falling back to temp-file", step_label)
+
+    # ── slow path: temp-file round-trip (legacy) ─────────────────────
     with tempfile.TemporaryDirectory() as tmpdir:
         input_path = str(Path(tmpdir) / "input.xlsx")
         _write_dataset_to_excel(ds, input_path)

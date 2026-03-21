@@ -1,8 +1,8 @@
 """Tests for MSPipeline orchestrator.
 
 Focuses on the processing steps (4, 8, 10, 11) which are pure DataFrame
-operations. Calibration steps (5-7, 9) require file I/O and are tested
-separately.
+operations.  The ``TestCalibrationInMemory`` class validates the new
+in-memory calibration path added to eliminate temp-file round-trips.
 """
 
 import numpy as np
@@ -10,7 +10,14 @@ import pandas as pd
 import pytest
 
 from ms_core.dataset import MSDataset
-from ms_core.pipeline import MSPipeline, PipelineConfig, STEPS, TOTAL_STEPS
+from ms_core.pipeline import (
+    MSPipeline,
+    PipelineConfig,
+    STEPS,
+    TOTAL_STEPS,
+    _dataset_to_calibration_df,
+    _calibration_df_to_dataset,
+)
 
 
 @pytest.fixture
@@ -163,3 +170,203 @@ class TestRunAll:
         pipeline = MSPipeline()
         with pytest.raises(ValueError, match="Invalid step"):
             pipeline.run_step(99, sample_dataset)
+
+
+# ======================================================================
+# Calibration in-memory helpers and round-trip tests
+# ======================================================================
+
+
+class TestCalibrationInMemory:
+    """Validate in-memory calibration helpers and module entry points."""
+
+    @pytest.fixture
+    def calibration_dataset(self):
+        """MSDataset with m/z-rt style feature IDs and sample info."""
+        np.random.seed(99)
+        n_samples, n_features = 15, 30
+        feature_ids = [f"{100 + i * 0.5:.4f}/{10 + i * 0.3:.1f}" for i in range(n_features)]
+        sample_ids = [f"Sample_{i:02d}" for i in range(n_samples)]
+
+        matrix = pd.DataFrame(
+            np.random.exponential(scale=5000, size=(n_samples, n_features)),
+            index=sample_ids,
+            columns=feature_ids,
+        )
+        labels = pd.Series(
+            ["Control"] * 7 + ["Exposed"] * 8,
+            index=matrix.index,
+            name="Group",
+        )
+        sample_info = pd.DataFrame(
+            {
+                "Sample_Name": sample_ids,
+                "Sample_Type": (["Control"] * 5 + ["QC"] * 3 + ["Exposed"] * 5 + ["QC"] * 2),
+                "Injection_Order": list(range(1, n_samples + 1)),
+                "Batch": ["Batch1"] * 8 + ["Batch2"] * 7,
+            },
+            index=sample_ids,
+        )
+        return MSDataset(
+            matrix=matrix,
+            labels=labels,
+            sample_info=sample_info,
+        )
+
+    # ------------------------------------------------------------------
+    # Round-trip: MSDataset ↔ calibration DataFrame
+    # ------------------------------------------------------------------
+
+    def test_roundtrip_preserves_shape(self, calibration_dataset):
+        """_dataset_to_calibration_df → _calibration_df_to_dataset preserves shape."""
+        ds = calibration_dataset
+        cal_df = _dataset_to_calibration_df(ds)
+
+        # cal_df should be features×samples with FeatureID first column
+        assert cal_df.columns[0] == "FeatureID"
+        assert cal_df.shape[0] == ds.n_features
+        # sample columns = all columns except FeatureID
+        assert len(cal_df.columns) - 1 == ds.n_samples
+
+        # Convert back
+        restored = _calibration_df_to_dataset(cal_df, ds, step_num=5)
+        assert restored.matrix.shape == ds.matrix.shape
+        # Values should match (within float tolerance)
+        pd.testing.assert_frame_equal(
+            restored.matrix.sort_index(axis=0).sort_index(axis=1),
+            ds.matrix.sort_index(axis=0).sort_index(axis=1),
+            atol=1e-10,
+        )
+
+    def test_roundtrip_preserves_labels(self, calibration_dataset):
+        ds = calibration_dataset
+        cal_df = _dataset_to_calibration_df(ds)
+        restored = _calibration_df_to_dataset(cal_df, ds, step_num=5)
+        pd.testing.assert_series_equal(restored.labels, ds.labels)
+
+    def test_calibration_df_orientation(self, calibration_dataset):
+        """Calibration df should have features as rows, samples as columns."""
+        ds = calibration_dataset
+        cal_df = _dataset_to_calibration_df(ds)
+
+        # Row count = number of features
+        assert cal_df.shape[0] == ds.n_features
+        # First column contains original column names (feature IDs)
+        assert set(cal_df["FeatureID"]) == set(ds.matrix.columns)
+        # Remaining columns are sample IDs
+        sample_cols = cal_df.columns[1:]
+        assert set(sample_cols) == set(ds.matrix.index)
+
+    # ------------------------------------------------------------------
+    # ISTD process_in_memory
+    # ------------------------------------------------------------------
+
+    def test_istd_process_in_memory(self, calibration_dataset):
+        """ISTD process_in_memory with explicitly marked ISTDs."""
+        from ms_core.calibration.istd_correction import process_in_memory
+
+        ds = calibration_dataset
+        cal_df = _dataset_to_calibration_df(ds)
+
+        # Mark first 3 features as ISTD
+        istd_ids = cal_df["FeatureID"].iloc[:3].tolist()
+
+        result = process_in_memory(
+            cal_df,
+            ds.sample_info.copy(),
+            istd_feature_ids=istd_ids,
+        )
+
+        assert result is not None
+        assert "FeatureID" in result.columns
+        # Result should have fewer features (ISTDs are removed from output)
+        assert len(result) == ds.n_features - len(istd_ids)
+        # Sample columns should be present
+        sample_cols = [c for c in result.columns if c != "FeatureID"]
+        assert len(sample_cols) > 0
+
+    def test_istd_reads_feature_info_is_istd(self, calibration_dataset):
+        """_step_istd_correction extracts ISTD IDs from feature_info.is_istd."""
+        from unittest.mock import patch, MagicMock
+        from ms_core.pipeline import _step_istd_correction
+
+        ds = calibration_dataset
+        # Populate feature_info with is_istd column (simulating ISTDMarker output)
+        feature_ids = ds.matrix.columns.tolist()
+        istd_mask = [True] * 3 + [False] * (len(feature_ids) - 3)
+        ds.feature_info = pd.DataFrame(
+            {"is_istd": istd_mask},
+            index=feature_ids,
+        )
+
+        # Mock the calibration module so we can inspect what was passed
+        mock_mod = MagicMock()
+        mock_result_df = _dataset_to_calibration_df(ds)
+        mock_mod.process_in_memory.return_value = mock_result_df
+
+        with patch("importlib.import_module", return_value=mock_mod):
+            _step_istd_correction(ds)
+
+        # Verify istd_feature_ids was passed through
+        call_kwargs = mock_mod.process_in_memory.call_args
+        assert "istd_feature_ids" in call_kwargs.kwargs
+        assert set(call_kwargs.kwargs["istd_feature_ids"]) == set(feature_ids[:3])
+
+    def test_istd_returns_none_without_istd_info(self, calibration_dataset):
+        """Without ISTD markers, should return None for fallback."""
+        from ms_core.calibration.istd_correction import process_in_memory
+
+        ds = calibration_dataset
+        cal_df = _dataset_to_calibration_df(ds)
+        result = process_in_memory(cal_df, ds.sample_info.copy())
+        assert result is None
+
+    # ------------------------------------------------------------------
+    # Batch effect process_in_memory
+    # ------------------------------------------------------------------
+
+    def test_batch_effect_single_batch_passthrough(self, calibration_dataset):
+        """Single batch → returns data unchanged."""
+        from ms_core.calibration.batch_effect import process_in_memory
+
+        ds = calibration_dataset
+        cal_df = _dataset_to_calibration_df(ds)
+
+        # Force single batch
+        single_batch_info = ds.sample_info.copy()
+        single_batch_info["Batch"] = "Batch1"
+
+        result = process_in_memory(cal_df, single_batch_info)
+        assert result is not None
+        # Should be the same DataFrame (single batch = no correction)
+        pd.testing.assert_frame_equal(result, cal_df)
+
+    # ------------------------------------------------------------------
+    # Wrapper integration
+    # ------------------------------------------------------------------
+
+    def test_calibration_wrapper_uses_inmemory_path(self, calibration_dataset):
+        """_calibration_wrapper dispatches to process_in_memory when available."""
+        from unittest.mock import patch, MagicMock
+        from ms_core.pipeline import _calibration_wrapper
+
+        ds = calibration_dataset
+
+        # Create a mock module with process_in_memory
+        mock_mod = MagicMock()
+        mock_result_df = _dataset_to_calibration_df(ds)  # pass-through
+        mock_mod.process_in_memory.return_value = mock_result_df
+
+        with patch("importlib.import_module", return_value=mock_mod):
+            result = _calibration_wrapper(
+                step_num=7,
+                calibration_module="mock.module",
+                ds=ds,
+            )
+
+        # process_in_memory should have been called
+        mock_mod.process_in_memory.assert_called_once()
+        # main() should NOT have been called (no fallback)
+        mock_mod.main.assert_not_called()
+        assert isinstance(result, MSDataset)
+        assert any("[Step 7]" in msg for msg in result.processing_log)
