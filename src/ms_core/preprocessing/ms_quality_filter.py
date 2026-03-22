@@ -608,10 +608,13 @@ class FeatureFilter(BaseProcessor):
             block_positive = np.where(block > 0, block, np.nan)
             # Avoid RuntimeWarning on all-NaN rows by using +inf sentinel.
             mins = np.min(np.where(np.isnan(block_positive), np.inf, block_positive), axis=1)
-            mins = np.where(np.isinf(mins), signal_threshold, mins)
+            no_positive = np.isinf(mins)
+            mins = np.where(no_positive, signal_threshold, mins)
 
             special = special_case[group_name]
-            fill_values = np.where(special, signal_threshold, mins / 2)
+            # If an entire group block is absent, preserve zero instead of
+            # fabricating a half-threshold pseudo-signal.
+            fill_values = np.where(no_positive, 0.0, np.where(special, signal_threshold, mins / 2))
 
             filled = np.where(missing_mask, fill_values[:, None], block)
             block_values[:, pos] = filled
@@ -639,8 +642,10 @@ class FeatureFilter(BaseProcessor):
                 if missing_mask.any():
                     block_positive = np.where(block > 0, block, np.nan)
                     qc_mins = np.min(np.where(np.isnan(block_positive), np.inf, block_positive), axis=1)
-                    qc_mins = np.where(np.isinf(qc_mins), signal_threshold, qc_mins)
-                    fill_values = (qc_mins / 2)[:, None]
+                    qc_no_positive = np.isinf(qc_mins)
+                    qc_mins = np.where(qc_no_positive, signal_threshold, qc_mins)
+                    qc_fill_values = np.where(qc_no_positive, 0.0, qc_mins / 2)
+                    fill_values = qc_fill_values[:, None]
                     filled = np.where(missing_mask, fill_values, block)
                     block_values[:, pos] = filled
 
