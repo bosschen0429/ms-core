@@ -546,7 +546,8 @@ class FeatureFilter(BaseProcessor):
             "cells_imputed": 0,
             "cells_imputed_from_nan": 0,
             "cells_imputed_from_zero": 0,
-            "imputation_method": "group_min_half",
+            "cells_skipped_low_prevalence": 0,
+            "imputation_method": "group_min_fifth_p40",
         }
 
         # Track imputed cells for blue font marking
@@ -612,15 +613,24 @@ class FeatureFilter(BaseProcessor):
             mins = np.where(no_positive, signal_threshold, mins)
 
             special = special_case[group_name]
-            # If an entire group block is absent, preserve zero instead of
-            # fabricating a half-threshold pseudo-signal.
-            fill_values = np.where(no_positive, 0.0, np.where(special, signal_threshold, mins / 2))
+            # Skip imputation when group detection rate < 40%:
+            # too few real signals to justify fabricating values.
+            grp_ratio = group_ratios.get(group_name, np.zeros(len(df) - 1))
+            low_prevalence = grp_ratio < 0.4
+            fill_values = np.where(
+                no_positive | low_prevalence, 0.0,
+                np.where(special, signal_threshold, mins / 5),
+            )
 
             filled = np.where(missing_mask, fill_values[:, None], block)
             block_values[:, pos] = filled
 
             idx = np.argwhere(missing_mask)
             if idx.size > 0:
+                # Count cells skipped due to low prevalence
+                skipped_mask = missing_mask & low_prevalence[:, None] & ~no_positive[:, None]
+                stats["cells_skipped_low_prevalence"] += int(skipped_mask.sum())
+
                 rows = (idx[:, 0] + 1).astype(int).tolist()
                 cols = [col_indices[j] for j in idx[:, 1].tolist()]
                 imputed_cells.extend(list(zip(rows, cols)))
@@ -644,13 +654,27 @@ class FeatureFilter(BaseProcessor):
                     qc_mins = np.min(np.where(np.isnan(block_positive), np.inf, block_positive), axis=1)
                     qc_no_positive = np.isinf(qc_mins)
                     qc_mins = np.where(qc_no_positive, signal_threshold, qc_mins)
-                    qc_fill_values = np.where(qc_no_positive, 0.0, qc_mins / 2)
+                    # Apply same prevalence gate to QC columns
+                    qc_ratio_col = ratio_cols.get("QC")
+                    if qc_ratio_col and qc_ratio_col in df.columns:
+                        qc_ratio = pd.to_numeric(
+                            df[qc_ratio_col].iloc[1:], errors="coerce",
+                        ).fillna(0).to_numpy()
+                    else:
+                        qc_ratio = np.zeros(len(df) - 1)
+                    qc_low_prevalence = qc_ratio < 0.4
+                    qc_fill_values = np.where(
+                        qc_no_positive | qc_low_prevalence, 0.0, qc_mins / 5,
+                    )
                     fill_values = qc_fill_values[:, None]
                     filled = np.where(missing_mask, fill_values, block)
                     block_values[:, pos] = filled
 
                     idx = np.argwhere(missing_mask)
                     if idx.size > 0:
+                        skipped_mask = missing_mask & qc_low_prevalence[:, None] & ~qc_no_positive[:, None]
+                        stats["cells_skipped_low_prevalence"] += int(skipped_mask.sum())
+
                         rows = (idx[:, 0] + 1).astype(int).tolist()
                         cols = [qc_cols[j] for j in idx[:, 1].tolist()]
                         imputed_cells.extend(list(zip(rows, cols)))
