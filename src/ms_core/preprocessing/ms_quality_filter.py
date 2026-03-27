@@ -171,6 +171,24 @@ class FeatureFilter(BaseProcessor):
                 numeric_block,
             )
 
+            # Step 4: Convert 0 → NaN in sample/QC columns
+            # Zero means "not detected" and should be treated as missing
+            # to avoid corrupting downstream log-transform and fold-change.
+            self.update_progress(85, "Converting zeros to NaN...")
+            all_data_cols = []
+            for cols in group_info["groups"].values():
+                all_data_cols.extend(cols)
+            all_data_cols.extend(group_info.get("qc_cols", []))
+            if all_data_cols:
+                for col_idx in all_data_cols:
+                    col_name = result_df.columns[col_idx]
+                    series = pd.to_numeric(result_df[col_name].iloc[1:], errors="coerce")
+                    zeros_converted = int((series == 0).sum())
+                    series = series.replace(0, np.nan)
+                    result_df[col_name] = [result_df.iat[0, col_idx]] + series.tolist()
+                    filter_stats.setdefault("zeros_converted_to_nan", 0)
+                    filter_stats["zeros_converted_to_nan"] += zeros_converted
+
             self.update_progress(100, "Feature filtering complete")
 
             # Compile statistics
