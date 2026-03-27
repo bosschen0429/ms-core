@@ -1,11 +1,10 @@
 """
 Feature Filter Module - Step 4 of the preprocessing pipeline.
 
-This module handles feature filtering and missing value imputation:
+This module handles feature filtering:
 - Dynamic sample type detection
 - Ratio calculation for each group
 - Multi-criteria feature filtering
-- Intelligent missing value imputation
 
 Based on: Feature_barrier_V3.bas
 """
@@ -22,7 +21,7 @@ from ms_core.utils.validators import detect_fixed_columns
 
 class FeatureFilter(BaseProcessor):
     """
-    Filters features and imputes missing values.
+    Filters features based on detection ratio and intensity criteria.
 
     This processor:
     1. Automatically detects sample types from row 2
@@ -32,7 +31,6 @@ class FeatureFilter(BaseProcessor):
        - Different: Any two groups with ratio difference >= diff threshold
        - Intensity: Any two groups with mean intensity fold-change >= threshold
     4. Removes features with QC_ratio = 0 or below threshold
-    5. Imputes missing values using group-specific minimum/2
     """
 
     def __init__(self, config: Optional[FeatureFilterConfig] = None):
@@ -97,7 +95,7 @@ class FeatureFilter(BaseProcessor):
             **kwargs: Additional parameters
 
         Returns:
-            ProcessingResult with filtered data and imputed values
+            ProcessingResult with filtered data
         """
         self.reset()
 
@@ -173,33 +171,15 @@ class FeatureFilter(BaseProcessor):
                 numeric_block,
             )
 
-            if self._cancelled:
-                return ProcessingResult(success=False, message="Processing cancelled")
-
-            # Step 4: Impute missing values
-            self.update_progress(75, "Imputing missing values...")
-            result_df, impute_stats = self._impute_missing_values(
-                result_df,
-                group_info,
-                ratio_cols,
-            )
-
             self.update_progress(100, "Feature filtering complete")
 
             # Compile statistics
             stats = {
                 **filter_stats,
-                **impute_stats,
                 "final_features": len(result_df) - 1,
                 "groups_detected": len(group_info["groups"]),
                 "has_qc": group_info["has_qc"],
             }
-
-            # Create deleted features DataFrame
-            deleted_df = None
-            if deleted_features:
-                # Reconstruct deleted rows
-                pass  # Handled in metadata
 
             return ProcessingResult(
                 success=True,
@@ -223,12 +203,6 @@ class FeatureFilter(BaseProcessor):
                         "intensity_fc": bool(enable_intensity_fc_threshold),
                     },
                     "deleted_features": deleted_features,
-                    "blue_font_cells": impute_stats.get("imputed_cells", []),
-                    "imputation_stats": {
-                        "cells_imputed": int(impute_stats.get("cells_imputed", 0)),
-                        "cells_imputed_from_nan": int(impute_stats.get("cells_imputed_from_nan", 0)),
-                        "cells_imputed_from_zero": int(impute_stats.get("cells_imputed_from_zero", 0)),
-                    },
                     "red_font_rows": filter_stats.get("red_font_rows", []),
                     "protected_rows": filter_stats.get("red_font_rows", []),
                 },
@@ -530,171 +504,6 @@ class FeatureFilter(BaseProcessor):
         if not ratios:
             return 0.0
         return float(max(ratios) - min(ratios))
-
-    def _impute_missing_values(
-        self,
-        df: pd.DataFrame,
-        group_info: Dict[str, Any],
-        ratio_cols: Dict[str, str],
-    ) -> Tuple[pd.DataFrame, Dict[str, Any]]:
-        """
-        Impute missing values using group-specific minimum/2.
-
-        Returns DataFrame with imputed values and statistics.
-        """
-        stats = {
-            "cells_imputed": 0,
-            "cells_imputed_from_nan": 0,
-            "cells_imputed_from_zero": 0,
-            "cells_skipped_low_prevalence": 0,
-            "imputation_method": "group_min_fifth_p40",
-        }
-
-        # Track imputed cells for blue font marking
-        imputed_cells = []
-
-        signal_threshold = self.config.signal_threshold
-
-        # Precompute group ratios for special cases
-        group_ratios = {}
-        for group_name in group_info["groups"].keys():
-            ratio_col = ratio_cols.get(group_name)
-            if ratio_col:
-                group_ratios[group_name] = pd.to_numeric(df[ratio_col].iloc[1:], errors="coerce").fillna(0).to_numpy()
-            else:
-                group_ratios[group_name] = np.zeros(len(df) - 1)
-
-        # Precompute special-case mask per group
-        special_case = {}
-        if len(group_info["groups"]) > 1:
-            for group_name in group_info["groups"].keys():
-                grp_ratio = group_ratios.get(group_name, np.zeros(len(df) - 1))
-                other_all_one = np.ones(len(df) - 1, dtype=bool)
-                for other_name in group_info["groups"].keys():
-                    if other_name == group_name:
-                        continue
-                    other_all_one &= (group_ratios.get(other_name, np.zeros(len(df) - 1)) == 1.0)
-                special_case[group_name] = (grp_ratio == 0) & other_all_one
-        else:
-            for group_name in group_info["groups"].keys():
-                special_case[group_name] = np.zeros(len(df) - 1, dtype=bool)
-
-        # Build numeric block once for all group/QC columns
-        all_cols_set = set()
-        for cols in group_info["groups"].values():
-            all_cols_set.update(cols)
-        all_cols_set.update(group_info.get("qc_cols", []))
-        all_cols = sorted(all_cols_set)
-        col_pos = {col_idx: pos for pos, col_idx in enumerate(all_cols)}
-        if all_cols:
-            block_all = df.iloc[1:, all_cols].apply(pd.to_numeric, errors="coerce")
-            block_values = block_all.to_numpy(copy=True)
-        else:
-            block_values = np.zeros((len(df) - 1, 0))
-
-        # Impute group columns in blocks
-        for group_name, col_indices in group_info["groups"].items():
-            if not col_indices:
-                continue
-            pos = [col_pos[c] for c in col_indices]
-            block = block_values[:, pos]
-            if block.shape[0] == 0:
-                continue
-            missing_nan_mask = np.isnan(block)
-            missing_zero_mask = (block == 0)
-            missing_mask = missing_nan_mask | missing_zero_mask
-            if not missing_mask.any():
-                continue
-
-            block_positive = np.where(block > 0, block, np.nan)
-            # Avoid RuntimeWarning on all-NaN rows by using +inf sentinel.
-            mins = np.min(np.where(np.isnan(block_positive), np.inf, block_positive), axis=1)
-            no_positive = np.isinf(mins)
-            mins = np.where(no_positive, signal_threshold, mins)
-
-            special = special_case[group_name]
-            # Skip imputation when group detection rate < 40%:
-            # too few real signals to justify fabricating values.
-            grp_ratio = group_ratios.get(group_name, np.zeros(len(df) - 1))
-            low_prevalence = grp_ratio < 0.4
-            fill_values = np.where(
-                no_positive | low_prevalence, 0.0,
-                np.where(special, signal_threshold, mins / 5),
-            )
-
-            filled = np.where(missing_mask, fill_values[:, None], block)
-            block_values[:, pos] = filled
-
-            idx = np.argwhere(missing_mask)
-            if idx.size > 0:
-                # Count cells skipped due to low prevalence
-                skipped_mask = missing_mask & low_prevalence[:, None] & ~no_positive[:, None]
-                stats["cells_skipped_low_prevalence"] += int(skipped_mask.sum())
-
-                rows = (idx[:, 0] + 1).astype(int).tolist()
-                cols = [col_indices[j] for j in idx[:, 1].tolist()]
-                imputed_cells.extend(list(zip(rows, cols)))
-                nan_count = int(missing_nan_mask.sum())
-                zero_count = int(missing_zero_mask.sum())
-                stats["cells_imputed"] += (nan_count + zero_count)
-                stats["cells_imputed_from_nan"] += nan_count
-                stats["cells_imputed_from_zero"] += zero_count
-
-        # Impute QC columns in blocks
-        qc_cols = group_info.get("qc_cols", [])
-        if qc_cols:
-            pos = [col_pos[c] for c in qc_cols]
-            block = block_values[:, pos]
-            if block.shape[0] > 0:
-                missing_nan_mask = np.isnan(block)
-                missing_zero_mask = (block == 0)
-                missing_mask = missing_nan_mask | missing_zero_mask
-                if missing_mask.any():
-                    block_positive = np.where(block > 0, block, np.nan)
-                    qc_mins = np.min(np.where(np.isnan(block_positive), np.inf, block_positive), axis=1)
-                    qc_no_positive = np.isinf(qc_mins)
-                    qc_mins = np.where(qc_no_positive, signal_threshold, qc_mins)
-                    # Apply same prevalence gate to QC columns
-                    qc_ratio_col = ratio_cols.get("QC")
-                    if qc_ratio_col and qc_ratio_col in df.columns:
-                        qc_ratio = pd.to_numeric(
-                            df[qc_ratio_col].iloc[1:], errors="coerce",
-                        ).fillna(0).to_numpy()
-                    else:
-                        qc_ratio = np.zeros(len(df) - 1)
-                    qc_low_prevalence = qc_ratio < 0.4
-                    qc_fill_values = np.where(
-                        qc_no_positive | qc_low_prevalence, 0.0, qc_mins / 5,
-                    )
-                    fill_values = qc_fill_values[:, None]
-                    filled = np.where(missing_mask, fill_values, block)
-                    block_values[:, pos] = filled
-
-                    idx = np.argwhere(missing_mask)
-                    if idx.size > 0:
-                        skipped_mask = missing_mask & qc_low_prevalence[:, None] & ~qc_no_positive[:, None]
-                        stats["cells_skipped_low_prevalence"] += int(skipped_mask.sum())
-
-                        rows = (idx[:, 0] + 1).astype(int).tolist()
-                        cols = [qc_cols[j] for j in idx[:, 1].tolist()]
-                        imputed_cells.extend(list(zip(rows, cols)))
-                        nan_count = int(missing_nan_mask.sum())
-                        zero_count = int(missing_zero_mask.sum())
-                        stats["cells_imputed"] += (nan_count + zero_count)
-                        stats["cells_imputed_from_nan"] += nan_count
-                        stats["cells_imputed_from_zero"] += zero_count
-
-        # Write back to DataFrame — rebuild each column as a Python list
-        # so that pandas 3.x StringDtype columns are replaced with object
-        # dtype columns that accept numeric values.
-        if all_cols:
-            for i, col_idx in enumerate(all_cols):
-                col_name = df.columns[col_idx]
-                df[col_name] = [df.iat[0, col_idx]] + block_values[:, i].tolist()
-
-        stats["imputed_cells"] = imputed_cells
-
-        return df, stats
 
     def get_group_summary(
         self,
