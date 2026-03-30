@@ -44,10 +44,16 @@ class DuplicateRemovalConfig:
     # Tolerance settings
     mz_tolerance_ppm: float = 20.0
     rt_tolerance: float = 1.0
+    degeneracy_ppm_tolerance: float = 20.0
+    degeneracy_rt_tolerance: float = 0.05
+    degeneracy_correlation_threshold: float = 0.8
+    degeneracy_min_correlation_points: int = 3
 
     # Processing options
     preserve_red_font: bool = True
     top_n_results: Optional[int] = None
+    enable_degeneracy_annotation: bool = False
+    degeneracy_adduct_table_file: Optional[str] = None
 
     # Column detection keywords
     rt_keywords: list = field(default_factory=lambda: ["rt", "retention", "time", "min"])

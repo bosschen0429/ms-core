@@ -10,6 +10,7 @@ This module handles intelligent duplicate signal removal:
 Based on: ms-data-processor (https://github.com/bosschen0429/ms-data-processor)
 """
 
+from pathlib import Path
 from typing import Optional, Dict, Any, List, Set, Tuple
 import pandas as pd
 import numpy as np
@@ -67,6 +68,12 @@ class DuplicateRemover(BaseProcessor):
         rt_tolerance: Optional[float] = None,
         top_n: Optional[int] = None,
         protected_rows: Optional[Set[int]] = None,
+        enable_degeneracy_annotation: Optional[bool] = None,
+        degeneracy_ppm_tolerance: Optional[float] = None,
+        degeneracy_rt_tolerance: Optional[float] = None,
+        degeneracy_correlation_threshold: Optional[float] = None,
+        degeneracy_min_correlation_points: Optional[int] = None,
+        degeneracy_adduct_table_file: Optional[str] = None,
         **kwargs,
     ) -> ProcessingResult:
         """
@@ -88,6 +95,37 @@ class DuplicateRemover(BaseProcessor):
         # Use config defaults if not specified
         mz_tol = mz_tolerance_ppm if mz_tolerance_ppm is not None else self.config.mz_tolerance_ppm
         rt_tol = rt_tolerance if rt_tolerance is not None else self.config.rt_tolerance
+
+        degeneracy_enabled = (
+            enable_degeneracy_annotation
+            if enable_degeneracy_annotation is not None
+            else self.config.enable_degeneracy_annotation
+        )
+        degeneracy_ppm = (
+            degeneracy_ppm_tolerance
+            if degeneracy_ppm_tolerance is not None
+            else self.config.degeneracy_ppm_tolerance
+        )
+        degeneracy_rt = (
+            degeneracy_rt_tolerance
+            if degeneracy_rt_tolerance is not None
+            else self.config.degeneracy_rt_tolerance
+        )
+        degeneracy_adduct_table_path = (
+            degeneracy_adduct_table_file
+            if degeneracy_adduct_table_file is not None
+            else self.config.degeneracy_adduct_table_file
+        )
+        degeneracy_corr_threshold = (
+            degeneracy_correlation_threshold
+            if degeneracy_correlation_threshold is not None
+            else self.config.degeneracy_correlation_threshold
+        )
+        degeneracy_min_corr_points_value = (
+            degeneracy_min_correlation_points
+            if degeneracy_min_correlation_points is not None
+            else self.config.degeneracy_min_correlation_points
+        )
 
         # Validate input
         is_valid, error_msg = self.validate_input(df)
@@ -168,6 +206,28 @@ class DuplicateRemover(BaseProcessor):
                     if orig_idx in protected_rows:
                         new_protected_rows.add(new_idx + 1)
 
+            degeneracy_stats: Dict[str, Any] = {
+                "degeneracy_annotation_enabled": bool(degeneracy_enabled),
+                "degeneracy_matches": 0,
+                "degeneracy_groups": 0,
+                "degeneracy_base_count": 0,
+                "degeneracy_adduct_count": 0,
+                "degeneracy_corr_rejected": 0,
+            }
+            adduct_table_source = "disabled"
+            if degeneracy_enabled:
+                self.update_progress(90, "Annotating degeneracy relationships...")
+                unique_data, degeneracy_stats, adduct_table_source = self._annotate_degeneracy(
+                    unique_data,
+                    col_info=col_info,
+                    sample_type_row=result_df.iloc[0].copy(),
+                    ppm_tolerance=degeneracy_ppm,
+                    rt_tolerance=degeneracy_rt,
+                    correlation_threshold=degeneracy_corr_threshold,
+                    min_correlation_points=degeneracy_min_corr_points_value,
+                    adduct_table_file=degeneracy_adduct_table_path,
+                )
+
             # Clean up temporary columns
             temp_cols = ['_mz', '_rt', '_total_intensity', '_occurrence', '_orig_index']
             for col in temp_cols:
@@ -185,13 +245,20 @@ class DuplicateRemover(BaseProcessor):
             stats = {
                 **parse_stats,
                 **dup_stats,
+                **degeneracy_stats,
                 "final_features": len(result_df) - 1,
             }
+
+            message = f"Duplicate removal completed. Removed {dup_stats.get('duplicates_removed', 0)} duplicates."
+            if degeneracy_enabled:
+                message += (
+                    f" Annotated {degeneracy_stats.get('degeneracy_adduct_count', 0)} degeneracy features."
+                )
 
             return ProcessingResult(
                 success=True,
                 data=result_df,
-                message=f"Duplicate removal completed. Removed {dup_stats.get('duplicates_removed', 0)} duplicates.",
+                message=message,
                 statistics=stats,
                 metadata={
                     "mz_tolerance_ppm": mz_tol,
@@ -199,6 +266,12 @@ class DuplicateRemover(BaseProcessor):
                     "column_info": col_info,
                     "red_font_rows": sorted(new_protected_rows),
                     "protected_rows": sorted(new_protected_rows),
+                    "degeneracy_annotation_enabled": bool(degeneracy_enabled),
+                    "degeneracy_ppm_tolerance": degeneracy_ppm,
+                    "degeneracy_rt_tolerance": degeneracy_rt,
+                    "degeneracy_correlation_threshold": degeneracy_corr_threshold,
+                    "degeneracy_min_correlation_points": degeneracy_min_corr_points_value,
+                    "degeneracy_adduct_table_source": adduct_table_source,
                 },
             )
 
@@ -471,3 +544,285 @@ class DuplicateRemover(BaseProcessor):
                 groups.append(group)
 
         return groups
+
+    def _annotate_degeneracy(
+        self,
+        df: pd.DataFrame,
+        *,
+        col_info: Dict[str, Any],
+        sample_type_row: pd.Series,
+        ppm_tolerance: float,
+        rt_tolerance: float,
+        correlation_threshold: float,
+        min_correlation_points: int,
+        adduct_table_file: Optional[str],
+    ) -> Tuple[pd.DataFrame, Dict[str, Any], str]:
+        """Annotate adduct-like degeneracy relationships on the deduplicated matrix."""
+        annotated = df.copy()
+        annotation_cols = {
+            "Degeneracy_Type": "None",
+            "Degeneracy_Description": "",
+            "Degeneracy_Base_mz": "",
+            "Degeneracy_PPM_Error": "",
+            "Degeneracy_Group_Role": "singleton",
+            "Degeneracy_Group_ID": "",
+            "Degeneracy_Pearson_R": "",
+        }
+        for col, default in annotation_cols.items():
+            annotated[col] = default
+
+        if len(annotated) == 0:
+            return annotated, {
+                "degeneracy_annotation_enabled": True,
+                "degeneracy_matches": 0,
+                "degeneracy_groups": 0,
+                "degeneracy_base_count": 0,
+                "degeneracy_adduct_count": 0,
+                "degeneracy_corr_rejected": 0,
+            }, "empty"
+
+        adduct_table, source = self._load_adduct_table(adduct_table_file)
+        if adduct_table.empty:
+            return annotated, {
+                "degeneracy_annotation_enabled": True,
+                "degeneracy_matches": 0,
+                "degeneracy_groups": 0,
+                "degeneracy_base_count": 0,
+                "degeneracy_adduct_count": 0,
+                "degeneracy_corr_rejected": 0,
+            }, source
+
+        valid = annotated[
+            annotated["_mz"].notna()
+            & annotated["_rt"].notna()
+            & (annotated["_mz"] > 0)
+        ].copy()
+        if valid.empty:
+            return annotated, {
+                "degeneracy_annotation_enabled": True,
+                "degeneracy_matches": 0,
+                "degeneracy_groups": 0,
+                "degeneracy_base_count": 0,
+                "degeneracy_adduct_count": 0,
+                "degeneracy_corr_rejected": 0,
+            }, source
+
+        correlation_cols = self._select_degeneracy_correlation_columns(sample_type_row, col_info)
+        valid = valid.sort_values(["_rt", "_mz", "_total_intensity"], ascending=[True, True, False])
+        pair_matches: dict[int, list[dict[str, Any]]] = {}
+        base_matches: dict[int, list[dict[str, Any]]] = {}
+        corr_rejected = 0
+
+        rows = list(valid.iterrows())
+        for i, current in enumerate(rows):
+            j = i + 1
+            while j < len(rows):
+                other = rows[j]
+                current_idx, current_row = current
+                other_idx, other_row = other
+                rt_diff = float(other_row["_rt"] - current_row["_rt"])
+                if rt_diff > rt_tolerance:
+                    break
+
+                base, pair = (current, other) if current_row["_mz"] <= other_row["_mz"] else (other, current)
+                base_idx, base_row = base
+                pair_idx, pair_row = pair
+                mz_diff = float(pair_row["_mz"] - base_row["_mz"])
+                match = self._find_best_adduct_match(
+                    mz_diff,
+                    float(max(base_row["_mz"], pair_row["_mz"])),
+                    adduct_table,
+                    ppm_tolerance,
+                )
+                if match is not None:
+                    corr_value = self._compute_feature_correlation(
+                        annotated,
+                        int(base_idx),
+                        int(pair_idx),
+                        correlation_cols,
+                        min_correlation_points,
+                    )
+                    if corr_value is None or corr_value < correlation_threshold:
+                        corr_rejected += 1
+                        j += 1
+                        continue
+                    payload = {
+                        "base_idx": int(base_idx),
+                        "base_mz": float(base_row["_mz"]),
+                        "adduct_type": match["To"],
+                        "ppm_error": float(match["ppm_error"]),
+                        "corr_value": float(corr_value),
+                    }
+                    pair_matches.setdefault(int(pair_idx), []).append(payload)
+                    base_matches.setdefault(int(base_idx), []).append(payload)
+                j += 1
+
+        group_counter = 1
+        assigned_bases: set[int] = set()
+        for pair_idx in sorted(pair_matches):
+            matches = sorted(pair_matches[pair_idx], key=lambda item: (item["ppm_error"], item["base_mz"]))
+            adduct_types = "; ".join(match["adduct_type"] for match in matches)
+            base_mz_values = "; ".join(f"{match['base_mz']:.4f}" for match in matches)
+            ppm_values = "; ".join(f"{match['ppm_error']:.2f}" for match in matches)
+            corr_values = "; ".join(f"{match['corr_value']:.3f}" for match in matches)
+            descriptions = "; ".join(
+                f"{match['adduct_type']} of base m/z {match['base_mz']:.4f} (r={match['corr_value']:.3f})"
+                for match in matches
+            )
+            group_id = f"DG{group_counter:04d}"
+            annotated.at[pair_idx, "Degeneracy_Type"] = adduct_types
+            annotated.at[pair_idx, "Degeneracy_Description"] = descriptions
+            annotated.at[pair_idx, "Degeneracy_Base_mz"] = base_mz_values
+            annotated.at[pair_idx, "Degeneracy_PPM_Error"] = ppm_values
+            annotated.at[pair_idx, "Degeneracy_Group_Role"] = "adduct"
+            annotated.at[pair_idx, "Degeneracy_Group_ID"] = group_id
+            annotated.at[pair_idx, "Degeneracy_Pearson_R"] = corr_values
+
+            for match in matches:
+                base_idx = match["base_idx"]
+                if base_idx in assigned_bases:
+                    continue
+                annotated.at[base_idx, "Degeneracy_Type"] = "[M+H]+"
+                annotated.at[base_idx, "Degeneracy_Description"] = (
+                    f"Base peak for degeneracy group {group_id} (best r={match['corr_value']:.3f})"
+                )
+                annotated.at[base_idx, "Degeneracy_Base_mz"] = f"{match['base_mz']:.4f}"
+                annotated.at[base_idx, "Degeneracy_PPM_Error"] = ""
+                annotated.at[base_idx, "Degeneracy_Group_Role"] = "base"
+                annotated.at[base_idx, "Degeneracy_Group_ID"] = group_id
+                annotated.at[base_idx, "Degeneracy_Pearson_R"] = f"{match['corr_value']:.3f}"
+                assigned_bases.add(base_idx)
+            group_counter += 1
+
+        stats = {
+            "degeneracy_annotation_enabled": True,
+            "degeneracy_matches": int(sum(len(v) for v in pair_matches.values())),
+            "degeneracy_groups": int(len(base_matches)),
+            "degeneracy_base_count": int(len(base_matches)),
+            "degeneracy_adduct_count": int(len(pair_matches)),
+            "degeneracy_corr_rejected": int(corr_rejected),
+        }
+        return annotated, stats, source
+
+    def _select_degeneracy_correlation_columns(
+        self,
+        sample_type_row: pd.Series,
+        col_info: Dict[str, Any],
+    ) -> List[str]:
+        """Choose columns used for Pearson correlation in degeneracy annotation."""
+        intensity_cols = [str(col) for col in col_info.get("intensity_cols", []) if col in sample_type_row.index]
+        if not intensity_cols:
+            return intensity_cols
+
+        preferred_cols: List[str] = []
+        fallback_cols: List[str] = []
+        for col in intensity_cols:
+            sample_type = str(sample_type_row.get(col, "")).strip().lower()
+            if sample_type in {"", "nan", "na", "none"}:
+                continue
+            fallback_cols.append(col)
+            if sample_type not in {"qc", "blank", "standard", "sdolek"}:
+                preferred_cols.append(col)
+
+        if len(preferred_cols) >= 3:
+            return preferred_cols
+        if len(fallback_cols) >= 2:
+            return fallback_cols
+        return preferred_cols or fallback_cols
+
+    def _compute_feature_correlation(
+        self,
+        df: pd.DataFrame,
+        base_idx: int,
+        pair_idx: int,
+        correlation_cols: List[str],
+        min_correlation_points: int,
+    ) -> Optional[float]:
+        """Compute Pearson correlation on shared positive intensities."""
+        if len(correlation_cols) < 2:
+            return None
+
+        base_series = pd.to_numeric(df.loc[base_idx, correlation_cols], errors="coerce")
+        pair_series = pd.to_numeric(df.loc[pair_idx, correlation_cols], errors="coerce")
+        valid_mask = (
+            base_series.notna()
+            & pair_series.notna()
+            & (base_series > 0)
+            & (pair_series > 0)
+        )
+        shared = int(valid_mask.sum())
+        if shared < max(2, min_correlation_points):
+            return None
+
+        base_vals = np.log1p(base_series[valid_mask].astype(float).to_numpy())
+        pair_vals = np.log1p(pair_series[valid_mask].astype(float).to_numpy())
+        if np.std(base_vals) == 0 or np.std(pair_vals) == 0:
+            return None
+
+        corr = np.corrcoef(base_vals, pair_vals)[0, 1]
+        if np.isnan(corr):
+            return None
+        return float(corr)
+
+    def _find_best_adduct_match(
+        self,
+        mz_diff: float,
+        reference_mz: float,
+        adduct_table: pd.DataFrame,
+        ppm_tolerance: float,
+    ) -> Optional[Dict[str, Any]]:
+        """Return the closest adduct-table match within ppm tolerance."""
+        if reference_mz <= 0:
+            return None
+
+        best_match: Optional[Dict[str, Any]] = None
+        tolerance_da = ppm_tolerance * reference_mz / 1_000_000
+
+        for row in adduct_table.itertuples(index=False):
+            delta = float(row.Delta_Da)
+            abs_error = abs(mz_diff - delta)
+            if abs_error > tolerance_da:
+                continue
+            ppm_error = abs_error / reference_mz * 1_000_000
+            candidate = {
+                "To": row.To,
+                "Delta_Da": delta,
+                "ppm_error": ppm_error,
+            }
+            if best_match is None or candidate["ppm_error"] < best_match["ppm_error"]:
+                best_match = candidate
+
+        return best_match
+
+    def _load_adduct_table(self, custom_file: Optional[str]) -> Tuple[pd.DataFrame, str]:
+        """Load a custom adduct table or fall back to built-in defaults."""
+        if custom_file:
+            path = Path(custom_file)
+            if path.exists():
+                try:
+                    if path.suffix.lower() in {".csv"}:
+                        custom_df = pd.read_csv(path)
+                    elif path.suffix.lower() in {".tsv", ".txt"}:
+                        custom_df = pd.read_csv(path, sep="\t")
+                    else:
+                        custom_df = pd.read_excel(path)
+                    required_cols = {"To", "Delta_Da"}
+                    ordered_cols = ["To", "Delta_Da"]
+                    if required_cols.issubset(custom_df.columns) and not custom_df.empty:
+                        return custom_df[ordered_cols].copy(), str(path)
+                except Exception:
+                    pass
+        return self._create_default_adduct_table(), "built-in"
+
+    def _create_default_adduct_table(self) -> pd.DataFrame:
+        """Provide a compact default adduct table for v1 degeneracy annotation."""
+        return pd.DataFrame(
+            [
+                {"To": "[M+Na]+", "Delta_Da": 21.981943},
+                {"To": "[M+K]+", "Delta_Da": 37.955882},
+                {"To": "[M+NH4]+", "Delta_Da": 17.026549},
+                {"To": "[M+ACN+H]+", "Delta_Da": 41.026549},
+                {"To": "[M+H]+ isotope", "Delta_Da": 1.003355},
+                {"To": "[M+H]+ isotope +2", "Delta_Da": 2.006710},
+            ]
+        )
