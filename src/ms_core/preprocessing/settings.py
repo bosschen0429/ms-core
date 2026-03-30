@@ -67,7 +67,8 @@ class FeatureFilterConfig:
 
     # Default filter thresholds
     default_background_threshold: float = 0.33
-    default_diff_threshold: float = 0.30
+    default_high_det_thresh: float = 0.8
+    default_low_det_thresh: float = 0.2
     default_intensity_fc_threshold: float = 2.0
     default_qc_ratio_threshold: float = 0.0
 

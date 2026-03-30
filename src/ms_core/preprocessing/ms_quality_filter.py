@@ -68,11 +68,11 @@ class FeatureFilter(BaseProcessor):
         self,
         df: pd.DataFrame,
         background_threshold: Optional[float] = None,
-        diff_threshold: Optional[float] = None,
+        high_det_thresh: Optional[float] = None,
+        low_det_thresh: Optional[float] = None,
         qc_ratio_threshold: Optional[float] = None,
         intensity_fc_threshold: Optional[float] = None,
         enable_background_threshold: bool = True,
-        enable_diff_threshold: bool = True,
         enable_qc_ratio_threshold: bool = True,
         enable_intensity_fc_threshold: bool = True,
         protected_rows: Optional[Set[int]] = None,
@@ -84,11 +84,11 @@ class FeatureFilter(BaseProcessor):
         Args:
             df: Input DataFrame
             background_threshold: Threshold for stable features (0-1)
-            diff_threshold: Threshold for differential features (0-1)
+            high_det_thresh: MNAR high detection rate threshold (0-1, default 0.8)
+            low_det_thresh: MNAR low detection rate threshold (0-1, default 0.2)
             qc_ratio_threshold: Minimum QC_ratio to keep a feature (0-1)
             intensity_fc_threshold: Minimum fold-change of group mean intensities (>=1)
             enable_background_threshold: Whether to apply stable feature rule
-            enable_diff_threshold: Whether to apply differential feature rule
             enable_qc_ratio_threshold: Whether to apply QC-based deletion rules
             enable_intensity_fc_threshold: Whether to apply intensity fold-change rule
             protected_rows: Set of row indices (red font) to protect from removal
@@ -100,18 +100,20 @@ class FeatureFilter(BaseProcessor):
         self.reset()
 
         # Deprecation guard for removed parameters
-        _REMOVED = {"skew_threshold", "enable_skew_threshold"}
+        _REMOVED = {"skew_threshold", "enable_skew_threshold",
+                    "diff_threshold", "enable_diff_threshold"}
         for removed_key in _REMOVED & kwargs.keys():
             warnings.warn(
                 f"Parameter '{removed_key}' was removed in the gate logic refactor. "
-                "It will be silently ignored. Use intensity_fc_threshold instead.",
+                "It will be silently ignored. Use high_det_thresh/low_det_thresh instead.",
                 DeprecationWarning,
                 stacklevel=2,
             )
 
         # Use config defaults if not specified
         bg_thresh = background_threshold if background_threshold is not None else self.config.default_background_threshold
-        diff_thresh = diff_threshold if diff_threshold is not None else self.config.default_diff_threshold
+        high_thresh = high_det_thresh if high_det_thresh is not None else self.config.default_high_det_thresh
+        low_thresh = low_det_thresh if low_det_thresh is not None else self.config.default_low_det_thresh
         qc_ratio_thresh = (
             qc_ratio_threshold
             if qc_ratio_threshold is not None
@@ -160,11 +162,11 @@ class FeatureFilter(BaseProcessor):
                 group_info,
                 ratio_cols,
                 bg_thresh,
-                diff_thresh,
+                high_thresh,
+                low_thresh,
                 qc_ratio_thresh,
                 intensity_fc_thresh,
                 enable_background_threshold,
-                enable_diff_threshold,
                 enable_qc_ratio_threshold,
                 enable_intensity_fc_threshold,
                 protected_rows or set(),
@@ -210,13 +212,13 @@ class FeatureFilter(BaseProcessor):
                     "ratio_columns": ratio_cols,
                     "thresholds": {
                         "background": bg_thresh,
-                        "diff": diff_thresh,
+                        "high_det": high_thresh,
+                        "low_det": low_thresh,
                         "qc_ratio": qc_ratio_thresh,
                         "intensity_fc": intensity_fc_thresh,
                     },
                     "enabled_thresholds": {
                         "background": bool(enable_background_threshold),
-                        "diff": bool(enable_diff_threshold),
                         "qc_ratio": bool(enable_qc_ratio_threshold),
                         "intensity_fc": bool(enable_intensity_fc_threshold),
                     },
@@ -352,11 +354,11 @@ class FeatureFilter(BaseProcessor):
         group_info: Dict[str, Any],
         ratio_cols: Dict[str, str],
         bg_threshold: float,
-        diff_threshold: float,
+        high_det_thresh: float,
+        low_det_thresh: float,
         qc_ratio_threshold: float,
         intensity_fc_threshold: float,
         enable_background_threshold: bool,
-        enable_diff_threshold: bool,
         enable_qc_ratio_threshold: bool,
         enable_intensity_fc_threshold: bool,
         protected_rows: Set[int],
@@ -371,13 +373,13 @@ class FeatureFilter(BaseProcessor):
             "kept_count": 0,
             "deleted_count": 0,
             "stable_kept": 0,
-            "diff_kept": 0,
+            "mnar_kept": 0,
             "intensity_fc_kept": 0,
             "qc_zero_deleted": 0,
             "qc_low_deleted": 0,
             "protected_kept": 0,
             "unique_stable_kept": 0,
-            "unique_diff_kept": 0,
+            "unique_mnar_kept": 0,
             "unique_intensity_fc_kept": 0,
         }
 
@@ -426,11 +428,14 @@ class FeatureFilter(BaseProcessor):
 
         # --- Ratio-based gates ---
         if ratio_matrix.shape[1] > 0:
-            # Max diff across groups
-            max_diff = ratio_matrix.max(axis=1) - ratio_matrix.min(axis=1)
-            diff_keep = (
-                max_diff >= diff_threshold
-                if enable_diff_threshold and ratio_matrix.shape[1] >= 2
+            # MNAR 80/20 gate: at least one group >= high_det_thresh AND
+            # at least one other group <= low_det_thresh.
+            # Because high_det_thresh > low_det_thresh, a single value cannot
+            # satisfy both conditions, so the "other group" constraint holds.
+            mnar_keep = (
+                (ratio_matrix >= high_det_thresh).any(axis=1) &
+                (ratio_matrix <= low_det_thresh).any(axis=1)
+                if ratio_matrix.shape[1] >= 2
                 else np.zeros(n_features, dtype=bool)
             )
             stable_keep = (
@@ -439,7 +444,7 @@ class FeatureFilter(BaseProcessor):
                 else np.zeros(n_features, dtype=bool)
             )
         else:
-            diff_keep = np.zeros(n_features, dtype=bool)
+            mnar_keep = np.zeros(n_features, dtype=bool)
             stable_keep = np.zeros(n_features, dtype=bool)
 
         # --- Intensity fold-change gate ---
@@ -469,8 +474,7 @@ class FeatureFilter(BaseProcessor):
         positive_rules = []
         if enable_background_threshold:
             positive_rules.append(stable_keep)
-        if enable_diff_threshold:
-            positive_rules.append(diff_keep)
+        positive_rules.append(mnar_keep)
         if enable_intensity_fc_threshold:
             positive_rules.append(intensity_fc_keep)
 
@@ -489,11 +493,11 @@ class FeatureFilter(BaseProcessor):
 
         stats["protected_kept"] = int(protected_mask.sum())
         stats["stable_kept"] = int((stable_keep & non_protected).sum())
-        stats["diff_kept"] = int((diff_keep & non_protected).sum())
+        stats["mnar_kept"] = int((mnar_keep & non_protected).sum())
         stats["intensity_fc_kept"] = int((intensity_fc_keep & non_protected).sum())
-        stats["unique_stable_kept"] = int((stable_keep & ~diff_keep & ~intensity_fc_keep & effective).sum())
-        stats["unique_diff_kept"] = int((diff_keep & ~stable_keep & ~intensity_fc_keep & effective).sum())
-        stats["unique_intensity_fc_kept"] = int((intensity_fc_keep & ~stable_keep & ~diff_keep & effective).sum())
+        stats["unique_stable_kept"] = int((stable_keep & ~mnar_keep & ~intensity_fc_keep & effective).sum())
+        stats["unique_mnar_kept"] = int((mnar_keep & ~stable_keep & ~intensity_fc_keep & effective).sum())
+        stats["unique_intensity_fc_kept"] = int((intensity_fc_keep & ~stable_keep & ~mnar_keep & effective).sum())
         stats["qc_zero_deleted"] = int((qc_zero & non_protected).sum())
         stats["qc_low_deleted"] = int((qc_low & non_protected).sum())
 
@@ -514,6 +518,15 @@ class FeatureFilter(BaseProcessor):
 
         # Filter DataFrame — .copy() ensures writable backing array (avoids numpy read-only error)
         result_df = df.iloc[rows_to_keep].reset_index(drop=True).copy()
+
+        # Append is_Presence_Absence_Marker column.
+        # rows_to_keep[0] is always 0 (Sample_Type header row).
+        # rows_to_keep[1:] are 1-based row indices into the original df;
+        # subtract 1 to get 0-based indices into mnar_keep.
+        mnar_col = ["is_Presence_Absence_Marker"]
+        for orig_row_idx in rows_to_keep[1:]:
+            mnar_col.append(bool(mnar_keep[orig_row_idx - 1]))
+        result_df.insert(len(result_df.columns), "is_Presence_Absence_Marker", mnar_col)
 
         return result_df, deleted_features, stats
 
