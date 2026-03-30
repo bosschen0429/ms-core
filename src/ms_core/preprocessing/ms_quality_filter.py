@@ -74,7 +74,7 @@ class FeatureFilter(BaseProcessor):
         intensity_fc_threshold: Optional[float] = None,
         enable_background_threshold: bool = True,
         enable_qc_ratio_threshold: bool = True,
-        enable_intensity_fc_threshold: bool = True,
+        enable_intensity_fc_threshold: bool = False,
         protected_rows: Optional[Set[int]] = None,
         **kwargs,
     ) -> ProcessingResult:
@@ -483,13 +483,14 @@ class FeatureFilter(BaseProcessor):
         else:
             keep_mask = np.ones(n_features, dtype=bool)
 
-        # If QC ratio fails gate and not protected, force delete
-        keep_mask = np.where((qc_zero | qc_low) & ~protected_mask, False, keep_mask)
+        # MNAR 80/20 markers are allowed to survive QC-negative gates because
+        # pooled-QC dilution can push true presence/absence features below LOD.
+        qc_force_delete = (qc_zero | qc_low) & ~protected_mask & ~mnar_keep
+        keep_mask = np.where(qc_force_delete, False, keep_mask)
 
         # Update stats
         non_protected = ~protected_mask
-        not_qc_killed = ~(qc_zero | qc_low)
-        effective = non_protected & not_qc_killed
+        effective = non_protected & ~qc_force_delete
 
         stats["protected_kept"] = int(protected_mask.sum())
         stats["stable_kept"] = int((stable_keep & non_protected).sum())
@@ -498,8 +499,8 @@ class FeatureFilter(BaseProcessor):
         stats["unique_stable_kept"] = int((stable_keep & ~mnar_keep & ~intensity_fc_keep & effective).sum())
         stats["unique_mnar_kept"] = int((mnar_keep & ~stable_keep & ~intensity_fc_keep & effective).sum())
         stats["unique_intensity_fc_kept"] = int((intensity_fc_keep & ~stable_keep & ~mnar_keep & effective).sum())
-        stats["qc_zero_deleted"] = int((qc_zero & non_protected).sum())
-        stats["qc_low_deleted"] = int((qc_low & non_protected).sum())
+        stats["qc_zero_deleted"] = int((qc_zero & non_protected & ~mnar_keep).sum())
+        stats["qc_low_deleted"] = int((qc_low & non_protected & ~mnar_keep).sum())
 
         # Build keep rows
         for i, keep in enumerate(keep_mask, start=1):
