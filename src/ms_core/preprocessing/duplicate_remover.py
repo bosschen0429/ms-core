@@ -336,10 +336,17 @@ class DuplicateRemover(BaseProcessor):
         return col_info
 
     def _is_numeric_column(self, series: pd.Series) -> bool:
-        """Check if a series contains mostly numeric values."""
+        """Check if a series contains numeric values.
+
+        LC-MS intensity columns are highly sparse (each sample typically detects
+        only 15-25% of features), so even a single numeric value qualifies.
+        Columns that are already numeric dtype are accepted immediately.
+        """
+        if pd.api.types.is_numeric_dtype(series):
+            return True
         try:
-            numeric_count = pd.to_numeric(series, errors='coerce').notna().sum()
-            return numeric_count >= len(series) * 0.5
+            converted = pd.to_numeric(series, errors="coerce")
+            return bool(converted.notna().any())
         except Exception:
             return False
 
