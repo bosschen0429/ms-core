@@ -479,15 +479,17 @@ class DuplicateRemover(BaseProcessor):
             # Select representative
             protected_in_group = [r for r in group if r["protected"]]
             if protected_in_group:
-                for r in protected_in_group:
-                    keep_indices.add(r["idx"])
-                    stats["protected_kept"] += 1
+                # ISTD rows compete among themselves; highest occurrence/intensity wins.
+                # Protected rows always beat unprotected ones, but duplicates within
+                # the ISTD set are still removed.
+                best = max(protected_in_group, key=lambda x: (x["occurrence"], x["intensity"]))
+                keep_indices.add(best["idx"])
+                stats["protected_kept"] += 1
             else:
                 best = max(group, key=lambda x: (x["occurrence"], x["intensity"]))
                 keep_indices.add(best["idx"])
 
-            kept_count = len(protected_in_group) if protected_in_group else 1
-            stats["duplicates_removed"] += len(group) - kept_count
+            stats["duplicates_removed"] += len(group) - 1
             for r in group:
                 processed_ids.add(r["idx"])
 
