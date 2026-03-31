@@ -43,7 +43,7 @@ class DuplicateRemovalConfig:
 
     # Tolerance settings
     mz_tolerance_ppm: float = 20.0
-    rt_tolerance: float = 1.0
+    rt_tolerance: float = 0.1
     degeneracy_ppm_tolerance: float = 20.0
     degeneracy_rt_tolerance: float = 0.05
     degeneracy_correlation_threshold: float = 0.8
