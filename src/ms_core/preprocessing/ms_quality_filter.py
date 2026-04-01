@@ -75,6 +75,8 @@ class FeatureFilter(BaseProcessor):
         enable_background_threshold: bool = True,
         enable_qc_ratio_threshold: bool = True,
         enable_intensity_fc_threshold: bool = False,
+        enable_mnar_gate: bool = True,
+        allow_single_group_stable: bool = False,
         protected_rows: Optional[Set[int]] = None,
         **kwargs,
     ) -> ProcessingResult:
@@ -91,6 +93,11 @@ class FeatureFilter(BaseProcessor):
             enable_background_threshold: Whether to apply stable feature rule
             enable_qc_ratio_threshold: Whether to apply QC-based deletion rules
             enable_intensity_fc_threshold: Whether to apply intensity fold-change rule
+            enable_mnar_gate: Whether to apply the MNAR 80/20 presence/absence rule
+            allow_single_group_stable: When True and only 1 analysis group exists,
+                degrade the stable gate to require only that single group to meet
+                the background threshold (instead of the usual >= 2 groups).
+                Only takes effect when enable_background_threshold is also True.
             protected_rows: Set of row indices (red font) to protect from removal
             **kwargs: Additional parameters
 
@@ -169,6 +176,8 @@ class FeatureFilter(BaseProcessor):
                 enable_background_threshold,
                 enable_qc_ratio_threshold,
                 enable_intensity_fc_threshold,
+                enable_mnar_gate,
+                allow_single_group_stable,
                 protected_rows or set(),
                 numeric_block,
             )
@@ -221,6 +230,8 @@ class FeatureFilter(BaseProcessor):
                         "background": bool(enable_background_threshold),
                         "qc_ratio": bool(enable_qc_ratio_threshold),
                         "intensity_fc": bool(enable_intensity_fc_threshold),
+                        "mnar_gate": bool(enable_mnar_gate),
+                        "single_group_stable": bool(allow_single_group_stable),
                     },
                     "deleted_features": deleted_features,
                     "red_font_rows": filter_stats.get("red_font_rows", []),
@@ -361,6 +372,8 @@ class FeatureFilter(BaseProcessor):
         enable_background_threshold: bool,
         enable_qc_ratio_threshold: bool,
         enable_intensity_fc_threshold: bool,
+        enable_mnar_gate: bool,
+        allow_single_group_stable: bool,
         protected_rows: Set[int],
         numeric_block: Dict[str, Any],
     ) -> Tuple[pd.DataFrame, List[pd.Series], Dict[str, Any]]:
@@ -432,17 +445,21 @@ class FeatureFilter(BaseProcessor):
             # at least one other group <= low_det_thresh.
             # Because high_det_thresh > low_det_thresh, a single value cannot
             # satisfy both conditions, so the "other group" constraint holds.
+            # Requires enable_mnar_gate=True and at least 2 groups.
             mnar_keep = (
                 (ratio_matrix >= high_det_thresh).any(axis=1) &
                 (ratio_matrix <= low_det_thresh).any(axis=1)
-                if ratio_matrix.shape[1] >= 2
+                if (enable_mnar_gate and ratio_matrix.shape[1] >= 2)
                 else np.zeros(n_features, dtype=bool)
             )
-            stable_keep = (
-                (ratio_matrix >= bg_threshold).sum(axis=1) >= 2
-                if enable_background_threshold
-                else np.zeros(n_features, dtype=bool)
-            )
+            if enable_background_threshold:
+                n_groups = ratio_matrix.shape[1]
+                # Degrade to single-group check when exactly 1 group and
+                # the caller has confirmed this intentional fallback.
+                required_groups = 1 if (allow_single_group_stable and n_groups == 1) else 2
+                stable_keep = (ratio_matrix >= bg_threshold).sum(axis=1) >= required_groups
+            else:
+                stable_keep = np.zeros(n_features, dtype=bool)
         else:
             mnar_keep = np.zeros(n_features, dtype=bool)
             stable_keep = np.zeros(n_features, dtype=bool)
