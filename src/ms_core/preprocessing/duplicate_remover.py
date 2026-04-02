@@ -165,8 +165,8 @@ class DuplicateRemover(BaseProcessor):
                 return ProcessingResult(success=False, message="Processing cancelled")
 
             # Step 4: Find unique signals
-            self.update_progress(60, "Identifying duplicate signals...")
-            unique_indices, dup_stats = self._find_unique_signals(
+            self.update_progress(50, "Identifying duplicate signals...")
+            unique_indices, dup_stats, merge_groups = self._find_unique_signals(
                 result_df,
                 mz_tol,
                 rt_tol,
@@ -176,7 +176,22 @@ class DuplicateRemover(BaseProcessor):
             if self._cancelled:
                 return ProcessingResult(success=False, message="Processing cancelled")
 
-            # Step 5: Filter to unique signals
+            # Step 5: Merge intensity data from duplicate rows into representatives
+            self.update_progress(65, "Merging duplicate intensity data...")
+            result_df, merge_stats = self._merge_duplicate_groups(
+                result_df,
+                merge_groups,
+                col_info["intensity_cols"],
+            )
+            dup_stats.update(merge_stats)
+
+            # Recalculate occurrence/intensity after merge
+            result_df = self._calculate_intensities(result_df, col_info)
+
+            if self._cancelled:
+                return ProcessingResult(success=False, message="Processing cancelled")
+
+            # Step 6: Filter to unique signals
             self.update_progress(80, "Filtering duplicates...")
 
             # Get header rows
@@ -188,8 +203,8 @@ class DuplicateRemover(BaseProcessor):
             unique_data = data_rows.iloc[data_positions].copy()
 
             # Sort by total intensity (descending)
-            if '_total_intensity' in unique_data.columns:
-                unique_data = unique_data.sort_values('_total_intensity', ascending=False)
+            if "_total_intensity" in unique_data.columns:
+                unique_data = unique_data.sort_values("_total_intensity", ascending=False)
 
             # Apply top N limit
             if top_n and top_n > 0 and len(unique_data) > top_n:
@@ -229,7 +244,7 @@ class DuplicateRemover(BaseProcessor):
                 )
 
             # Clean up temporary columns
-            temp_cols = ['_mz', '_rt', '_total_intensity', '_occurrence', '_orig_index']
+            temp_cols = ["_mz", "_rt", "_total_intensity", "_occurrence", "_orig_index"]
             for col in temp_cols:
                 if col in unique_data.columns:
                     unique_data = unique_data.drop(col, axis=1)
@@ -237,7 +252,10 @@ class DuplicateRemover(BaseProcessor):
                     header_rows = header_rows.drop(col, axis=1)
 
             # Reconstruct DataFrame
-            result_df = pd.concat([header_rows.reset_index(drop=True), unique_data.reset_index(drop=True)], ignore_index=True)
+            result_df = pd.concat(
+                [header_rows.reset_index(drop=True), unique_data.reset_index(drop=True)],
+                ignore_index=True,
+            )
 
             self.update_progress(100, "Duplicate removal complete")
 
@@ -250,10 +268,11 @@ class DuplicateRemover(BaseProcessor):
             }
 
             message = f"Duplicate removal completed. Removed {dup_stats.get('duplicates_removed', 0)} duplicates."
+            recovered = dup_stats.get("data_points_recovered", 0)
+            if recovered > 0:
+                message += f" Merged {dup_stats.get('groups_merged', 0)} groups, recovered {recovered} data points."
             if degeneracy_enabled:
-                message += (
-                    f" Annotated {degeneracy_stats.get('degeneracy_adduct_count', 0)} degeneracy features."
-                )
+                message += f" Annotated {degeneracy_stats.get('degeneracy_adduct_count', 0)} degeneracy features."
 
             return ProcessingResult(
                 success=True,
@@ -306,7 +325,11 @@ class DuplicateRemover(BaseProcessor):
             if mz is not None and rt is not None:
                 valid_combined += 1
 
-        if sample_values is not None and len(sample_values) > 0 and valid_combined >= len(sample_values) * 0.6:
+        if (
+            sample_values is not None
+            and len(sample_values) > 0
+            and valid_combined >= len(sample_values) * 0.6
+        ):
             col_info["combined_mz_rt"] = True
         else:
             # Look for separate RT and m/z columns
@@ -330,7 +353,9 @@ class DuplicateRemover(BaseProcessor):
             # Check if column name suggests intensity data
             is_intensity = any(kw in col_lower for kw in self.config.intensity_keywords)
             # Or if column contains numeric data
-            if is_intensity or self._is_numeric_column(df[col].iloc[1:] if len(df) > 1 else df[col]):
+            if is_intensity or self._is_numeric_column(
+                df[col].iloc[1:] if len(df) > 1 else df[col]
+            ):
                 col_info["intensity_cols"].append(col)
 
         return col_info
@@ -375,8 +400,16 @@ class DuplicateRemover(BaseProcessor):
             df["_rt"] = rt_series.to_numpy()
         else:
             # Use separate columns
-            mz_series = pd.to_numeric(df[col_info["mz_col"]], errors="coerce") if col_info["mz_col"] else pd.Series([np.nan] * len(df))
-            rt_series = pd.to_numeric(df[col_info["rt_col"]], errors="coerce") if col_info["rt_col"] else pd.Series([np.nan] * len(df))
+            mz_series = (
+                pd.to_numeric(df[col_info["mz_col"]], errors="coerce")
+                if col_info["mz_col"]
+                else pd.Series([np.nan] * len(df))
+            )
+            rt_series = (
+                pd.to_numeric(df[col_info["rt_col"]], errors="coerce")
+                if col_info["rt_col"]
+                else pd.Series([np.nan] * len(df))
+            )
             if len(mz_series) > 0:
                 mz_series.iloc[0] = np.nan
                 rt_series.iloc[0] = np.nan
@@ -419,11 +452,14 @@ class DuplicateRemover(BaseProcessor):
         mz_tolerance_ppm: float,
         rt_tolerance: float,
         protected_rows: Set[int],
-    ) -> Tuple[Set[int], Dict[str, Any]]:
+    ) -> Tuple[Set[int], Dict[str, Any], List[List[int]]]:
         """
         Find unique signals using RT-window grouping and m/z tolerance.
 
-        Returns set of row indices to keep and statistics.
+        Returns:
+            keep_indices: set of row indices to keep (representative per group)
+            stats: deduplication statistics
+            merge_groups: list of [best_idx, donor_idx, ...] lists for intensity merging
         """
         stats = {
             "original_features": len(df) - 1,
@@ -432,9 +468,10 @@ class DuplicateRemover(BaseProcessor):
         }
 
         if len(df) <= 1:
-            return set(range(len(df))), stats
+            return set(range(len(df))), stats, []
 
         keep_indices = {0}  # Always keep Sample_Type row
+        merge_groups: List[List[int]] = []
 
         # Build valid rows list
         valid_rows = []
@@ -442,14 +479,16 @@ class DuplicateRemover(BaseProcessor):
             mz = df.at[idx, "_mz"]
             rt = df.at[idx, "_rt"]
             if mz is not None and rt is not None and mz > 0:
-                valid_rows.append({
-                    "idx": idx,
-                    "mz": mz,
-                    "rt": rt,
-                    "intensity": df.at[idx, "_total_intensity"],
-                    "occurrence": df.at[idx, "_occurrence"],
-                    "protected": idx in protected_rows,
-                })
+                valid_rows.append(
+                    {
+                        "idx": idx,
+                        "mz": mz,
+                        "rt": rt,
+                        "intensity": df.at[idx, "_total_intensity"],
+                        "occurrence": df.at[idx, "_occurrence"],
+                        "protected": idx in protected_rows,
+                    }
+                )
 
         # Sort by RT first to allow a forward RT window scan.
         valid_rows.sort(key=lambda x: (x["rt"], x["mz"]))
@@ -479,9 +518,6 @@ class DuplicateRemover(BaseProcessor):
             # Select representative
             protected_in_group = [r for r in group if r["protected"]]
             if protected_in_group:
-                # ISTD rows compete among themselves; highest occurrence/intensity wins.
-                # Protected rows always beat unprotected ones, but duplicates within
-                # the ISTD set are still removed.
                 best = max(protected_in_group, key=lambda x: (x["occurrence"], x["intensity"]))
                 keep_indices.add(best["idx"])
                 stats["protected_kept"] += 1
@@ -489,11 +525,68 @@ class DuplicateRemover(BaseProcessor):
                 best = max(group, key=lambda x: (x["occurrence"], x["intensity"]))
                 keep_indices.add(best["idx"])
 
+            # Record merge group: [best_idx, donor1_idx, donor2_idx, ...]
+            if len(group) > 1:
+                donor_indices = [r["idx"] for r in group if r["idx"] != best["idx"]]
+                merge_groups.append([best["idx"]] + donor_indices)
+
             stats["duplicates_removed"] += len(group) - 1
             for r in group:
                 processed_ids.add(r["idx"])
 
-        return keep_indices, stats
+        return keep_indices, stats, merge_groups
+
+    def _merge_duplicate_groups(
+        self,
+        df: pd.DataFrame,
+        merge_groups: List[List[int]],
+        intensity_cols: List[str],
+    ) -> Tuple[pd.DataFrame, Dict[str, int]]:
+        """
+        Merge intensity data from donor rows into the representative row.
+
+        For each duplicate group, fills NaN values in the best row with
+        non-NaN values from donor rows. This recovers sample-feature data
+        points that would otherwise be lost by pick-best-only deduplication.
+
+        Args:
+            df: DataFrame with all rows still present
+            merge_groups: list of [best_idx, donor1_idx, ...] from _find_unique_signals
+            intensity_cols: sample intensity column names
+
+        Returns:
+            Modified DataFrame (in-place) and merge statistics
+        """
+        merge_stats = {
+            "groups_merged": 0,
+            "data_points_recovered": 0,
+        }
+
+        if not merge_groups or not intensity_cols:
+            return df, merge_stats
+
+        for group in merge_groups:
+            best_idx = group[0]
+            donor_indices = group[1:]
+            recovered_in_group = 0
+
+            for col in intensity_cols:
+                best_val = df.at[best_idx, col]
+                if pd.notna(best_val) and best_val != 0:
+                    continue
+                # Try each donor for this column
+                for donor_idx in donor_indices:
+                    donor_val = df.at[donor_idx, col]
+                    if pd.notna(donor_val) and donor_val != 0:
+                        df.at[best_idx, col] = donor_val
+                        recovered_in_group += 1
+                        break
+
+            if recovered_in_group > 0:
+                merge_stats["groups_merged"] += 1
+                merge_stats["data_points_recovered"] += recovered_in_group
+
+        return df, merge_stats
 
     def get_duplicate_groups(
         self,
@@ -517,8 +610,8 @@ class DuplicateRemover(BaseProcessor):
             if idx in processed:
                 continue
 
-            mz = df_with_mz_rt.at[idx, '_mz']
-            rt = df_with_mz_rt.at[idx, '_rt']
+            mz = df_with_mz_rt.at[idx, "_mz"]
+            rt = df_with_mz_rt.at[idx, "_rt"]
 
             if mz is None or rt is None:
                 continue
@@ -531,8 +624,8 @@ class DuplicateRemover(BaseProcessor):
                 if other_idx in processed:
                     continue
 
-                other_mz = df_with_mz_rt.at[other_idx, '_mz']
-                other_rt = df_with_mz_rt.at[other_idx, '_rt']
+                other_mz = df_with_mz_rt.at[other_idx, "_mz"]
+                other_rt = df_with_mz_rt.at[other_idx, "_rt"]
 
                 if other_mz is None or other_rt is None:
                     continue
@@ -541,7 +634,7 @@ class DuplicateRemover(BaseProcessor):
                 if mz != 0:
                     ppm_diff = abs((mz - other_mz) / mz * 1_000_000)
                 else:
-                    ppm_diff = float('inf')
+                    ppm_diff = float("inf")
 
                 rt_diff = abs(rt - other_rt)
 
@@ -581,40 +674,50 @@ class DuplicateRemover(BaseProcessor):
             annotated[col] = default
 
         if len(annotated) == 0:
-            return annotated, {
-                "degeneracy_annotation_enabled": True,
-                "degeneracy_matches": 0,
-                "degeneracy_groups": 0,
-                "degeneracy_base_count": 0,
-                "degeneracy_adduct_count": 0,
-                "degeneracy_corr_rejected": 0,
-            }, "empty"
+            return (
+                annotated,
+                {
+                    "degeneracy_annotation_enabled": True,
+                    "degeneracy_matches": 0,
+                    "degeneracy_groups": 0,
+                    "degeneracy_base_count": 0,
+                    "degeneracy_adduct_count": 0,
+                    "degeneracy_corr_rejected": 0,
+                },
+                "empty",
+            )
 
         adduct_table, source = self._load_adduct_table(adduct_table_file)
         if adduct_table.empty:
-            return annotated, {
-                "degeneracy_annotation_enabled": True,
-                "degeneracy_matches": 0,
-                "degeneracy_groups": 0,
-                "degeneracy_base_count": 0,
-                "degeneracy_adduct_count": 0,
-                "degeneracy_corr_rejected": 0,
-            }, source
+            return (
+                annotated,
+                {
+                    "degeneracy_annotation_enabled": True,
+                    "degeneracy_matches": 0,
+                    "degeneracy_groups": 0,
+                    "degeneracy_base_count": 0,
+                    "degeneracy_adduct_count": 0,
+                    "degeneracy_corr_rejected": 0,
+                },
+                source,
+            )
 
         valid = annotated[
-            annotated["_mz"].notna()
-            & annotated["_rt"].notna()
-            & (annotated["_mz"] > 0)
+            annotated["_mz"].notna() & annotated["_rt"].notna() & (annotated["_mz"] > 0)
         ].copy()
         if valid.empty:
-            return annotated, {
-                "degeneracy_annotation_enabled": True,
-                "degeneracy_matches": 0,
-                "degeneracy_groups": 0,
-                "degeneracy_base_count": 0,
-                "degeneracy_adduct_count": 0,
-                "degeneracy_corr_rejected": 0,
-            }, source
+            return (
+                annotated,
+                {
+                    "degeneracy_annotation_enabled": True,
+                    "degeneracy_matches": 0,
+                    "degeneracy_groups": 0,
+                    "degeneracy_base_count": 0,
+                    "degeneracy_adduct_count": 0,
+                    "degeneracy_corr_rejected": 0,
+                },
+                source,
+            )
 
         correlation_cols = self._select_degeneracy_correlation_columns(sample_type_row, col_info)
         valid = valid.sort_values(["_rt", "_mz", "_total_intensity"], ascending=[True, True, False])
@@ -633,7 +736,9 @@ class DuplicateRemover(BaseProcessor):
                 if rt_diff > rt_tolerance:
                     break
 
-                base, pair = (current, other) if current_row["_mz"] <= other_row["_mz"] else (other, current)
+                base, pair = (
+                    (current, other) if current_row["_mz"] <= other_row["_mz"] else (other, current)
+                )
                 base_idx, base_row = base
                 pair_idx, pair_row = pair
                 mz_diff = float(pair_row["_mz"] - base_row["_mz"])
@@ -669,7 +774,9 @@ class DuplicateRemover(BaseProcessor):
         group_counter = 1
         assigned_bases: set[int] = set()
         for pair_idx in sorted(pair_matches):
-            matches = sorted(pair_matches[pair_idx], key=lambda item: (item["ppm_error"], item["base_mz"]))
+            matches = sorted(
+                pair_matches[pair_idx], key=lambda item: (item["ppm_error"], item["base_mz"])
+            )
             adduct_types = "; ".join(match["adduct_type"] for match in matches)
             base_mz_values = "; ".join(f"{match['base_mz']:.4f}" for match in matches)
             ppm_values = "; ".join(f"{match['ppm_error']:.2f}" for match in matches)
@@ -719,7 +826,9 @@ class DuplicateRemover(BaseProcessor):
         col_info: Dict[str, Any],
     ) -> List[str]:
         """Choose columns used for Pearson correlation in degeneracy annotation."""
-        intensity_cols = [str(col) for col in col_info.get("intensity_cols", []) if col in sample_type_row.index]
+        intensity_cols = [
+            str(col) for col in col_info.get("intensity_cols", []) if col in sample_type_row.index
+        ]
         if not intensity_cols:
             return intensity_cols
 
@@ -754,10 +863,7 @@ class DuplicateRemover(BaseProcessor):
         base_series = pd.to_numeric(df.loc[base_idx, correlation_cols], errors="coerce")
         pair_series = pd.to_numeric(df.loc[pair_idx, correlation_cols], errors="coerce")
         valid_mask = (
-            base_series.notna()
-            & pair_series.notna()
-            & (base_series > 0)
-            & (pair_series > 0)
+            base_series.notna() & pair_series.notna() & (base_series > 0) & (pair_series > 0)
         )
         shared = int(valid_mask.sum())
         if shared < max(2, min_correlation_points):
